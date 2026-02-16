@@ -29,16 +29,59 @@ Only `experience.yaml`, `functions/`, `persona/`, and `README.md` are required. 
 
 ## How It Works
 
-1. **Browse** experience packages for your domain
-2. **Install** by cloning or downloading the package into your project
-3. **Wire up** the abstract tool interfaces to your concrete implementations (your CRM, your ticketing system, your codebase)
-4. **Your agent** now has the judgment of a seasoned professional
+### 1. Get the package
 
-The format is framework-agnostic. Any agent framework can consume it:
+An experience package is a directory of files. There's no code to install and no runtime dependencies. Clone it, download it, or copy it into your project.
+
+```bash
+git clone https://github.com/openexperience/radiant-sales-expert
+```
+
+### 2. Bind your tools
+
+The package manifest declares what tools it needs (e.g., `crm`, `email`, `calendar`). You map each abstract name to whatever you already have -- your HubSpot instance, your Nylas integration, your Google Calendar API. The package doesn't care how your tools work, only that they can answer the declared operations.
+
+```yaml
+# Example: binding abstract tools to your concrete implementations
+tools:
+  crm: my-hubspot-mcp-server
+  email: my-nylas-integration
+  calendar: my-google-calendar-api
+```
+
+### 3. Your framework consumes the package
+
+The framework reads the package files and uses them at runtime:
+- **Persona** becomes the agent's system prompt
+- **Functions** become capabilities the agent can invoke
+- **Knowledge** becomes reference material loaded into context
+- **Context declarations** tell the framework what data to fetch (from your bound tools) before each function runs
+- **Processes** orchestrate multi-step workflows across functions
+
+### 4. The agent has professional judgment
+
+Your AI agent now knows *when* to send the email, *who* to CC, *which* methodology applies, and *what* the next best action is -- using your real data from your real tools.
+
+### No code in the package
+
+This is the key design choice. An experience package is a **prompt engineering artifact with structure**, not a software dependency. It contains expert instructions, data requirements, and process definitions -- all in human-readable markdown and YAML. Any framework can consume it:
+
 - Read the markdown directly as system prompts
-- Map functions to agent definitions
+- Map functions to agent/skill definitions
 - Map processes to workflow chains
-- Map tools to your integration layer
+- Map tools to your integration layer (MCP servers, API clients, database queries, etc.)
+
+## For Framework Authors
+
+To make your framework consume openexperience packages:
+
+1. **Parse `experience.yaml`** to discover components and requirements
+2. **Provide a tool binding mechanism** so users can map abstract tool names to concrete implementations
+3. **Implement context resolution** -- read function `context` declarations, call bound tools, inject results into `{{template}}` variables
+4. **Load persona and knowledge** into the agent's prompt
+5. **Optionally support processes** for multi-step orchestration
+
+See the full [specification](spec.md) for details on each component type and the runtime consumption model.
 
 ## Specification
 

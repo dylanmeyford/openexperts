@@ -13,6 +13,81 @@ This document defines the structure, file formats, and schemas that all experien
 - **Ports and adapters**: The experience declares what it needs (tools, data shapes). The host project provides concrete implementations.
 - **Progressive complexity**: Only a few components are required. Everything else is opt-in.
 
+## Consumption Model
+
+An experience package contains no code. It is a set of files that a framework reads, interprets, and executes. This section describes the end-to-end flow from installation to runtime.
+
+### Installation
+
+Installation means getting the files into your project. There is no build step, no runtime to install, no dependencies to resolve. The package is a directory of markdown and YAML.
+
+```bash
+# Clone the package
+git clone https://github.com/openexperience/radiant-sales-expert
+
+# Or copy it into your project
+cp -r radiant-sales-expert/ ./experiences/radiant-sales-expert
+```
+
+### Tool Binding
+
+The manifest declares abstract tool names the package requires:
+
+```yaml
+requires:
+  tools: [crm, email, calendar]
+```
+
+The user must **bind** each abstract name to a concrete implementation in their environment. What that implementation looks like depends on the framework -- it might be an MCP server, an API client, a database query layer, or anything else that can satisfy the declared operations.
+
+The binding is a simple mapping from abstract names to concrete providers:
+
+```yaml
+# Example binding (format varies by framework)
+tools:
+  crm: my-hubspot-integration
+  email: my-nylas-integration
+  calendar: my-nylas-integration
+```
+
+The experience package does not care how the tools are implemented. It only requires that when it references `crm.fetch_contacts`, something answers with data matching the declared output shape.
+
+### Runtime Flow
+
+When a framework executes a function from the package:
+
+1. **Load persona** -- `persona/identity.md` and `persona/instructions.md` are injected into the system prompt
+2. **Load knowledge** -- any knowledge files referenced by the function are included as context
+3. **Resolve context** -- for each item in the function's `context` declarations (top to bottom):
+   - Look up the abstract tool name in the user's bindings
+   - Call the bound implementation with the declared operation and params
+   - Store the result for use by downstream context items and template variables
+4. **Populate template** -- replace all `{{variable}}` placeholders in the function body with the resolved data
+5. **Invoke the LLM** -- send the fully populated prompt to the model
+6. **Validate output** -- if the function is part of a process that produces actions, validate the output against the relevant action schemas
+
+Frameworks may parallelize context items that have no interdependencies (i.e., items that don't reference `$context.<previous_item>`).
+
+### Schema Handling
+
+Schemas (`schemas/*.yaml`) define the data shapes the experience expects. They serve as **contracts** between the package and the host:
+
+- **Required fields** must be present in the data returned by the bound tool. If a required field is missing, the framework should warn or error.
+- **Optional fields** are best-effort. The experience will work without them, but the agent's output quality may be reduced.
+- **Field naming**: Frameworks should be lenient with minor naming differences. If the bound tool returns `fullName` instead of `name`, or `jobTitle` instead of `role`, most LLMs will handle this gracefully. Strict schema validation is not required at v0.1 -- the schemas exist primarily as documentation for the integration boundary.
+
+### For Framework Authors
+
+To consume openexperience packages, a framework needs to:
+
+1. **Parse the manifest** (`experience.yaml`) to discover what the package contains and requires
+2. **Provide a tool binding mechanism** so users can map abstract tool names to concrete implementations
+3. **Implement context resolution** -- the ability to read a function's `context` declarations, call the bound tools, and inject results into template variables
+4. **Support template population** -- replace `{{variable}}` placeholders with serialized data (JSON, markdown tables, XML tags, or whatever format suits the model)
+5. **Optionally support processes** -- read `processes/*.yaml` and orchestrate multi-step function chains with branching and parallelism
+
+Frameworks that only support functions (not processes) can still consume any package -- they just invoke functions individually rather than orchestrating them as workflows.
+
 ## Package Structure
 
 ```
@@ -629,9 +704,21 @@ composed_fields:
 
 ## 6. Tools (`tools/`)
 
-**Optional.** YAML files declaring abstract integration interfaces. The experience says "I need a tool that can do X" -- the host project provides the concrete implementation.
+**Optional.** YAML files declaring abstract integration interfaces -- **contracts** that the host project must satisfy.
 
-This is the ports-and-adapters pattern: the experience knows *what* to do and *when*. The host knows *how* and *where*.
+An experience package never contains API clients, SDKs, or integration code. Instead, each `tools/*.yaml` file declares: "I need something that can perform these operations with these inputs and return these outputs." The host project provides the concrete implementation via tool binding (see Consumption Model).
+
+This is the ports-and-adapters pattern: the experience knows *what* data it needs and *when* to fetch it. The host knows *how* to fetch it and *where* it lives.
+
+### How Tool Binding Works
+
+When the manifest declares `requires: tools: [crm, email, calendar]`, the user maps each abstract name to whatever they already have:
+
+- `crm` might map to a HubSpot MCP server, a Salesforce API client, or a direct database connection
+- `email` might map to a Nylas integration, a Gmail API wrapper, or a SendGrid service
+- `calendar` might map to the same provider as `email` (many providers handle both)
+
+The tool declaration is the **contract**. The bound implementation is the **adapter**. The experience doesn't know or care which adapter is used -- only that it satisfies the declared operations.
 
 ### Schema
 
@@ -711,7 +798,12 @@ operations:
 
 ## 7. Schemas (`schemas/`)
 
-**Optional.** YAML files defining the data shapes the experience expects the host project to provide. This is the integration boundary -- it decouples the experience from any specific data source.
+**Optional.** YAML files defining the data shapes the experience expects the host project to provide. Schemas are the **integration boundary** -- they decouple the experience from any specific data source.
+
+Schemas serve two purposes:
+
+1. **Documentation** -- a developer wiring up tool bindings can read the schemas to understand exactly what data the experience expects, which fields are critical, and which are nice-to-have.
+2. **Validation** (optional) -- frameworks may validate data returned by bound tools against the declared schemas. However, strict validation is not required. Required fields should be present; optional fields are best-effort. Minor naming differences between the schema and the actual data (e.g., `fullName` vs `name`) are generally handled well by the LLM and should not cause hard failures.
 
 ### Schema
 
