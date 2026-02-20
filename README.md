@@ -2,13 +2,28 @@
 
 **Professional expertise for AI agents.**
 
-openexperts is an open specification for packaging professional expertise -- the judgment, processes, and domain knowledge that professionals use daily -- into a format any AI agent framework can consume.
+OpenExperts is an open specification for packaging professional expertise -- the judgment, processes, and domain knowledge that professionals use daily -- into a format any AI agent framework can consume.
 
 ## The Problem
 
-LLMs have knowledge, but not experience. For instance, they can write a follow up email, but they don't know when to send it, why they should multi-thread in Sarah, or that this prospect intially mentioned a competitor in a first email, and that their persistent quiet might mean a deal risk and to use a battle card. That judgment comes from years of professional practice performing and training in a role.
+LLMs have capability, but not experience. For instance, they can write a follow up email, but they don't know when to send it, why they should multi-thread in Sarah, or that this prospect intially mentioned a competitor in a first email, and that their persistent quiet might mean a deal risk and to use a battle card. That judgment comes from years of professional practice performing and training in a role.
 
 Openexperts bridges that gap. It defines a standard way to capture professional expertise as portable, framework-agnostic packages that give AI agents the judgment and workflows of a seasoned professional.
+
+## Why not just Skills.MD?
+
+A skill tells an agent how to do a single task.
+
+A skill is like a set recipe — generate slides, post them, save, repeat. 
+
+With Experts, you're encoding an entire professional role that operates proactively and reactively across unpredictable situations.
+
+It is a system comprising a runtime coordination layer (triggers, concurrency, execution policy), selective context loading, a knowledge base, tool use with contracts, internal state and processes.
+
+You could write the world's best skill file for triaging one email. But you can't write a skill file that simultaneously listens for Gmail webhooks, runs a morning innbox review, handles Linkedin messages, enforces that CRM reads are auto-approved but email sends are draft-only, retries when an API fails mid-process, and tracks 50 active deals with entity-scoped concurrency.
+
+In other words: Skills are capabilities. Experts are colleagues.
+
 
 ## What's in an Expert Package?
 
