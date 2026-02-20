@@ -17,16 +17,17 @@ An expert package is a directory of markdown and YAML files:
 
 | Component        | Format            | Purpose                                                            |
 | ---------------- | ----------------- | ------------------------------------------------------------------ |
-| **Manifest**     | `expert.yaml`     | Package metadata, dependencies, component listing                  |
+| **Manifest**     | `expert.yaml`     | Package metadata, dependencies, triggers, policy, component listing |
 | **Orchestrator** | `orchestrator.md` | Entry point. How the agent should use this expert package.         |
 | **Persona**      | `persona/`        | Agent identity and behavioral rules                                |
 | **Functions**    | `functions/*.md`  | Individual capabilities (markdown instructions + YAML frontmatter) |
-| **Processes**    | `processes/*.md`  | Multi-step workflows of processes that map across multiple functions |
+| **Processes**    | `processes/*.md`  | Multi-step workflows that coordinate functions and tools           |
 | **Tools**        | `tools/*.yaml`    | Abstract interfaces to external systems                            |
 | **Knowledge**    | `knowledge/*.md`  | Reference material (methodologies, frameworks, guidelines)         |
 | **State**        | `state/*.md`      | Builder-defined local storage files the agent reads and writes     |
+| **Scratch**      | `scratch/*.md`    | Runtime-generated working files for process resumption and audit   |
 
-Only `expert.yaml`, `orchestrator.md`, `functions/`, `persona/`, and `README.md` are required. Everything else is opt-in based on what the expertise demands — including `state/`, which is only needed if the expert is designed to maintain local state between runs.
+Only `expert.yaml`, `orchestrator.md`, `functions/`, `persona/`, and `README.md` are required. Everything else is opt-in based on what the expertise demands.
 
 ## How It Works
 
@@ -57,14 +58,17 @@ The framework reads the package files and uses them at runtime:
 - **Orchestrator** tells the agent when/how to use this expert package and which capabilities to reach for
 - **Persona** becomes the agent's system prompt
 - **Functions** become capabilities the agent can invoke
-- **Processes** orchestrate multi-step workflows (processes, decision heuristics etc) across functions
-- **Tools** declare what external systems the package needs to communicate with (e.g. CRM, email, calendar) you bind them to your implementations
+- **Processes** orchestrate multi-step workflows across functions and tools
+- **Tools** declare what external systems the package needs — you bind them to your implementations
 - **Knowledge** becomes reference material loaded into context
 - **State** becomes local read/write storage — the builder decides what files exist, what they track, and how the agent uses them
+- **Triggers** (declared in the manifest) wire events to processes — a new email arrives, a cron fires, a message comes in on a channel — and the framework handles concurrency, retries, and delivery
 
 ### 4. The agent has professional judgment
 
 Your AI agent now knows *when* to send the email, *who* to CC, *which* methodology applies, and *what* the next best action is -- using your real data from your real tools.
+
+The manifest also declares a **policy** governing which tool operations the agent can execute autonomously (`auto`), which require human approval (`confirm`), and which it should only draft for the human to execute (`manual`). Unknown operations default to `confirm` — the agent never gets silent write access unless the package author explicitly grants it.
 
 ### No code in the package
 
@@ -79,13 +83,15 @@ This is the key design choice. An expert package is a **prompt engineering artif
 
 To make your framework consume openexperts packages:
 
-1. **Parse `expert.yaml`** to discover components and requirements
-2. **Load `orchestrator.md`** into the agent's context so it knows when and how to use the expert package
-3. **Provide a tool binding mechanism** so users can map abstract tool names to concrete implementations
-4. **Load persona and knowledge** into the agent's prompt
-5. **Optionally support processes** for multi-step orchestration
+1. **Parse and validate `expert.yaml`** — discover components, verify required fields and cross-reference integrity (see [Validation](spec.md#13-validation))
+2. **Load orchestrator and persona** into the agent's persistent context
+3. **Bind abstract tools** to your concrete implementations (MCP servers, API clients, etc.)
+4. **Wire triggers** — map `webhook`, `cron`, and `channel` triggers to your runtime's event system, applying concurrency policy (`parallel`, `serial`, `serial_per_key`)
+5. **Enforce approval policy** — resolve the effective tier for each tool operation using the [resolution order](spec.md#approval-tier-resolution-order), handle `confirm` approval flow and `manual` draft delivery
+6. **Support execution guarantees** — timeouts, retries with backoff, scratchpad-based resumption, and failure escalation
+7. **Register functions and processes** as on-demand capabilities the agent can invoke
 
-See the full [specification](spec.md) for details on each component type and the runtime consumption model.
+See the full [specification](spec.md) for the complete runtime consumption model (section 12).
 
 ## Specification
 
