@@ -1,0 +1,13 @@
+---
+alwaysApply: true
+---
+
+Our goal is to build a 'expert packages' SPEC/standard, that can be installed into AI agents (such as OpenClaw) to allow capable agents to become domain experts.
+
+That is, turn a capable model such as Claude Opus 4.6 into an expert b2b sales rep who can manage your sales for you, interact with external API's and basically, do your job.
+
+This repo is for THAT only.
+
+There are sub-repos under experts which is a specific expert package, however we are purely focused on the spec/standard/readme in this repo. 
+
+We are defining and creating the global standard for expert packages, going forward.

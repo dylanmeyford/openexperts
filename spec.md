@@ -82,6 +82,9 @@ The manifest is the package index and metadata source.
 - `author` (string)
 - `license` (string)
 - `requires` (object): dependencies such as abstract tools.
+- `triggers` (array): automation entry points that invoke processes on events.
+- `concurrency` (object): package-level concurrency defaults inherited by all triggers.
+- `execution` (object): package-level process execution defaults inherited by all processes.
 
 ### `requires.tools`
 
@@ -95,6 +98,160 @@ requires:
     - crm
     - email
     - calendar
+```
+
+### `concurrency`
+
+`concurrency` sets the default execution model for all triggers in the package. Individual triggers inherit these defaults and may override them.
+
+#### Concurrency Fields
+
+- `default` (string): default concurrency mode. One of `parallel`, `serial`, or `serial_per_key`. Defaults to `parallel` if omitted.
+- `key` (string): default `concurrency_key` field path applied when `default` is `serial_per_key`. Individual triggers may override this with their own `concurrency_key`.
+
+#### When to set a package-level default
+
+Set a package-level default when most or all triggers share the same concurrency model. This avoids repeating the same setting on every trigger and prevents silent bugs from a missed per-trigger declaration.
+
+| Expert type | Recommended default |
+|---|---|
+| Sales agent | `serial_per_key`, key: `contact_id` |
+| Support agent | `serial_per_key`, key: `ticket_id` |
+| Legal agent | `serial_per_key`, key: `matter_id` |
+| Marketing agent | `parallel` |
+| Report generator | `serial` |
+
+#### Example
+
+```yaml
+# All triggers process in order per contact by default.
+# Any trigger can override this locally if it needs different behavior.
+concurrency:
+  default: serial_per_key
+  key: contact_id
+```
+
+### `execution`
+
+`execution` sets the default runtime guarantees for all processes in the package. Individual processes inherit these defaults and may override them in their own frontmatter.
+
+#### Execution Fields
+
+- `timeout` (string): maximum wall-clock time a process may run before the framework considers it failed. Use human-readable durations such as `5m`, `30m`, `2h`. Defaults to no timeout if omitted.
+- `idempotent` (boolean): declares whether it is safe to re-run the full process from step 1 on failure. When `true`, the framework may retry without risk of duplicate side-effects. When `false`, the framework must use scratchpad-based resumption rather than a full restart. Defaults to `false`.
+- `retry` (object): retry policy applied when a process fails.
+  - `max_attempts` (integer): maximum number of attempts including the first. Defaults to `1` (no retry).
+  - `backoff` (string): `fixed` or `exponential`. Defaults to `exponential`.
+  - `delay` (string): initial delay between attempts. Defaults to `30s`.
+- `on_failure` (string): action taken when all retry attempts are exhausted. One of:
+  - `escalate` (default): notify the main agent and user that the process failed and requires attention.
+  - `abandon`: log the failure silently and drop the task. Use only for non-critical background tasks.
+  - `dead_letter`: queue the failed invocation for manual review and reprocessing.
+- `resume_from_execution_log` (boolean): when `true`, the framework maintains an opaque execution log tracking which steps have completed, retry count, and failure details. On retry, the framework passes this context to the agent so it can resume from the last completed step rather than restarting from step 1. The execution log is framework-owned infrastructure — package authors never read or write it directly. It is separate from the process `scratchpad`, which is agent-owned working notes. Requires `idempotent: false`. Defaults to `true` when a scratchpad is declared on the process.
+
+#### Why these defaults matter
+
+Without explicit execution policy, a failed process silently disappears. For a sales agent, a failed email triage is a missed deal signal. Package authors should always declare a policy — even just `on_failure: escalate` — so failures are visible.
+
+#### Example
+
+```yaml
+# Processes get 10 minutes, retry up to 3 times with exponential backoff,
+# resume from scratchpad on retry, and escalate if still failing.
+execution:
+  timeout: 10m
+  idempotent: false
+  retry:
+    max_attempts: 3
+    backoff: exponential
+    delay: 30s
+  on_failure: escalate
+  resume_from_execution_log: true
+```
+
+### `triggers`
+
+`triggers` declares the automation entry points for this package. Each trigger defines when a process runs, how it is invoked, and what runtime behavior the framework should apply.
+
+Triggers are declarative. The framework (or loader) is responsible for wiring each trigger to the underlying runtime mechanism (webhook, cron schedule, channel event, etc.). Package authors declare intent; they do not configure infrastructure.
+
+#### Trigger Fields
+
+Required:
+
+- `name` (string): unique trigger name within the package. Must match the `trigger` field on the target process.
+- `type` (string): one of `webhook`, `cron`, or `channel`.
+- `process` (string): name of the process to invoke when this trigger fires.
+
+Optional:
+
+- `preset` (string): maps to a built-in runtime preset (for example `gmail` for the OpenClaw Gmail hook). When set, the framework uses its built-in handling for this event source.
+- `requires_tool` (string): abstract tool name that provides this trigger when no preset covers it. The framework must resolve this tool before the trigger can be active.
+- `expr` (string): cron expression (5-field standard or 6-field with seconds). Required when `type` is `cron`.
+- `tz` (string): IANA timezone for the cron expression. Defaults to UTC.
+- `dedupe_key` (string): field path in the incoming payload used to identify duplicate events. The framework should skip processing if an event with the same key was already handled within a reasonable window.
+- `session` (string): `isolated` (default, recommended) or `main`. `isolated` runs each trigger invocation in its own session. `main` enqueues an event into the primary agent session.
+- `concurrency` (string): overrides the package-level `concurrency.default` for this trigger. One of:
+  - `parallel`: each invocation runs immediately in its own session, with no coordination. Use for independent workloads such as processing multiple articles or documents at the same time.
+  - `serial`: all invocations of this trigger queue globally and run one at a time. Use when overlap would cause duplicate work or corrupted output, such as a nightly report that must not run twice.
+  - `serial_per_key`: invocations queue per a grouping key derived from the trigger payload. Invocations with the same key run in order; invocations with different keys run in parallel. Use for entity-scoped workflows such as a sales agent that must process emails for the same deal sequentially, while handling different deals concurrently.
+- `concurrency_key` (string): overrides the package-level `concurrency.key` for this trigger. Required when this trigger's effective concurrency mode is `serial_per_key` and no package-level key is set. A dot-notation path into the trigger payload identifying the grouping field (for example `contact_id`, `deal_id`, `thread_id`).
+- `description` (string): human-readable explanation of when this trigger fires.
+
+#### Trigger Types
+
+**`webhook`** — fires when an inbound HTTP event is received. The framework maps the trigger to a webhook endpoint or preset handler. Use this for email (Gmail PubSub), external app notifications, and any event-driven push source.
+
+**`cron`** — fires on a schedule defined by `expr` and `tz`. Use this for proactive tasks: scanning for opportunities, generating daily summaries, sending follow-up reminders.
+
+**`channel`** — fires when a message arrives on a connected messaging channel (for example iMessage, WhatsApp, Telegram, Slack). The framework routes incoming channel messages to the process when the message matches the trigger's channel source.
+
+#### Example Triggers Block
+
+```yaml
+triggers:
+  # serial_per_key: emails for the same deal are processed in order,
+  # but emails for different deals run in parallel.
+  - name: new_email
+    type: webhook
+    preset: gmail
+    dedupe_key: message_id
+    session: isolated
+    concurrency: serial_per_key
+    concurrency_key: contact_id
+    process: inbound-email-triage
+    description: Fires when a new email arrives in the monitored inbox.
+
+  # serial: the morning scan must not overlap with itself.
+  - name: opportunity_scan
+    type: cron
+    expr: "0 8 * * 1-5"
+    tz: Australia/Sydney
+    session: isolated
+    concurrency: serial
+    process: scan-for-opportunities
+    description: Runs every weekday morning to scan for new signals on active accounts.
+
+  # parallel: each article is independent; process them all at the same time.
+  - name: new_article
+    type: webhook
+    requires_tool: content_feed
+    dedupe_key: article_id
+    session: isolated
+    concurrency: parallel
+    process: process-article
+    description: Fires when a new article is published to the monitored feed.
+
+  # serial_per_key: LinkedIn DMs serialized per sender.
+  - name: linkedin_dm
+    type: webhook
+    requires_tool: linkedin
+    dedupe_key: message_id
+    session: isolated
+    concurrency: serial_per_key
+    concurrency_key: sender_id
+    process: handle-linkedin-dm
+    description: Fires when a new LinkedIn DM is received. Requires a LinkedIn tool binding.
 ```
 
 ### `components`
@@ -116,6 +273,41 @@ requires:
     - crm
     - email
 
+# All triggers default to serial_per_key on contact_id.
+# The opportunity scan overrides to serial (global queue, no per-key needed).
+concurrency:
+  default: serial_per_key
+  key: contact_id
+
+# All processes get 10 minutes, retry 3 times, resume from scratchpad, escalate on failure.
+execution:
+  timeout: 10m
+  idempotent: false
+  retry:
+    max_attempts: 3
+    backoff: exponential
+    delay: 30s
+  on_failure: escalate
+  resume_from_execution_log: true
+
+triggers:
+  - name: new_email
+    type: webhook
+    preset: gmail
+    dedupe_key: message_id
+    session: isolated
+    process: inbound-email-triage
+    description: Fires when a new email arrives in the monitored inbox.
+
+  - name: opportunity_scan
+    type: cron
+    expr: "0 8 * * 1-5"
+    tz: Australia/Sydney
+    session: isolated
+    concurrency: serial        # override: global queue, not per-contact
+    process: scan-for-opportunities
+    description: Runs every weekday morning to scan for new signals on active accounts.
+
 components:
   orchestrator: orchestrator.md
   persona:
@@ -127,6 +319,7 @@ components:
     - functions/compose-response.md
   processes:
     - processes/inbound-email-triage.md
+    - processes/scan-for-opportunities.md
   tools:
     - tools/crm.yaml
     - tools/email.yaml
@@ -273,6 +466,7 @@ Optional:
 - `functions` (array of function names): discovery and indexing support
 - `tools` (array of abstract tool names): discovery and indexing support
 - `scratchpad` (string): recommended working file path pattern
+- `execution` (object): overrides the package-level execution defaults for this process. Supports the same fields as the package-level `execution` block (`timeout`, `idempotent`, `retry`, `on_failure`, `resume_from_execution_log`). Only specified fields are overridden; unspecified fields inherit from the package default.
 
 ### Process Body Requirements
 
@@ -282,21 +476,23 @@ A process body should include:
 - Ordered steps section
 - Completion section with expected output
 
-### Checklist Pattern (Recommended)
+### Checklist Pattern (Required for resumable processes)
 
 Use markdown checkboxes for step tracking:
 
 - `- [ ] Step ...`
 
-This gives the agent explicit progress cues in agentic loops.
+This gives the agent explicit progress cues in agentic loops and is the mechanism by which the agent knows which steps are complete when resuming from a scratchpad.
 
-### Scratchpad Pattern (Recommended)
+### Scratchpad Pattern (Required when `resume_from_execution_log: true`)
 
-Processes may instruct the agent to write intermediate results to a file (for example under `./scratch/`), improving:
+Processes that declare a `scratchpad` path must instruct the agent to write intermediate step results to that file as they complete. This enables:
 
-- Context recovery
-- Auditability
-- Resumability
+- **Resumption**: on retry, the agent reads the scratchpad and continues from the last completed step rather than restarting from step 1, preventing duplicate side-effects such as double CRM writes or duplicate email sends.
+- **Auditability**: every process run leaves a record of what happened and what was decided at each step.
+- **Context recovery**: if context is compacted or the session is interrupted, the scratchpad preserves the working state.
+
+The first step of any resumable process must always be: create (or read if it already exists) the scratchpad file.
 
 ### Example Process
 
@@ -323,16 +519,20 @@ tools:
   - email
   - crm
 scratchpad: ./scratch/triage-{message_id}.md
+execution:
+  timeout: 10m
+  # inherits retry and on_failure from package-level execution defaults
 ---
 
 ## Inbound Email Triage
 
 Run this process whenever a new prospect email arrives.
 Follow every step in order and check it off after completion.
+If resuming after a failure, read the scratchpad first and skip any already-completed steps.
 
 ### Steps
 
-- [ ] Create a scratchpad file at `./scratch/triage-{message_id}.md`.
+- [ ] Open (or create) the scratchpad at `./scratch/triage-{message_id}.md`. If it exists, read it and resume from the first unchecked step.
 - [ ] Fetch the inbound email using the `email` tool and record sender, subject, body.
 - [ ] Fetch contact details from `crm` using sender email and record account context.
 - [ ] Fetch active deal details from `crm` and record stage, amount, competitors.
