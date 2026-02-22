@@ -1,10 +1,10 @@
 # OpenExperts → OpenClaw Loader Design
 
-Version: `draft-1`
+Version: `draft-2`
 
 ## Overview
 
-The loader bridges an openexperts package into an OpenClaw sub-agent session. It validates the package, assembles a system prompt (including resolved approval policy), binds abstract tools to MCP servers, wires triggers to OpenClaw's event system with concurrency control, and enforces execution guarantees (timeout, retry, resumption) and delivery settings at runtime.
+The loader bridges an openexperts package into an OpenClaw sub-agent session. It validates the package, assembles a system prompt (including resolved approval policy), binds abstract tools to concrete implementations (MCP servers or ClawHub skills), wires triggers to OpenClaw's event system with concurrency control, and enforces execution guarantees (timeout, retry, resumption) and delivery settings at runtime.
 
 ## How It Works
 
@@ -24,7 +24,7 @@ persona/*.md       →  ├─ assemble   →  system prompt
                       ┘
 functions/*.md     →  skill index   →  on-demand skills
 processes/*.md     →  skill index   →  on-demand skills
-tools/*.yaml       →  tool binding  →  MCP / tool config
+tools/*.yaml       →  tool binding  →  MCP servers / ClawHub skills
 knowledge/*.md     →  context plan  →  preloaded / on-demand
 state/*.md         →  state init    →  workspace files
 scratch/           →  runtime dir   →  ephemeral process working files
@@ -152,30 +152,41 @@ If `policy.escalation.on_low_confidence` is `true`, the loader also injects an i
 
 ## 3. Tool Binding
 
-The package declares abstract tools. The user binds them to concrete implementations.
+The package declares abstract tools. The user binds them to concrete implementations — either MCP servers or ClawHub skills.
 
 ### Binding Config
 
+Bindings are stored outside the package directory so `git pull` never touches them:
+
 ```yaml
-# ~/.openclaw/experts/radiant-sales-expert/bindings.yaml
+# ~/.openclaw/expert-config/radiant-sales-expert/bindings.yaml
 # (user-created, not part of the package)
 
 tools:
   crm:
-    type: mcp
-    server: hubspot-mcp
-    # maps to an MCP server configured in OpenClaw
+    type: skill
+    skill: attio
+    # maps to an installed ClawHub skill
+
   email:
     type: mcp
     server: nylas-mcp
+    # maps to an MCP server configured in OpenClaw
+
   calendar:
     type: mcp
     server: google-calendar-mcp
 ```
 
+### Binding Types
+
+**`type: mcp`** — Binds to an MCP server configured in OpenClaw. The loader adds the MCP server to the expert sub-agent's tool set. Operations map to MCP tool names.
+
+**`type: skill`** — Binds to a ClawHub or local skill installed on the system. The loader ensures the skill is eligible (installed, gating requirements met) and adds it to the expert sub-agent's available skills. The skill's SKILL.md teaches the agent how to use the tool — the expert's `tools/*.yaml` operations serve as documentation for what the expert needs; the skill provides the implementation.
+
 ### Operation Mapping
 
-The abstract tool spec declares operations like `crm.get_contact`. The binding config can optionally map these to specific MCP tool names if they don't match 1:1:
+For MCP bindings, the abstract tool spec declares operations like `crm.get_contact`. The binding config can optionally map these to specific MCP tool names if they don't match 1:1:
 
 ```yaml
 tools:
@@ -188,6 +199,18 @@ tools:
 ```
 
 If no operation mapping is provided, the loader assumes the MCP server exposes tools matching the operation names.
+
+For skill bindings, operation mapping is typically unnecessary — the skill defines its own tool surface and the agent learns how to use it from the skill's instructions. If the skill exposes tool names that differ from the abstract operations, an optional mapping can be provided:
+
+```yaml
+tools:
+  crm:
+    type: skill
+    skill: attio
+    operations:
+      get_contact: attio_find_person
+      get_deal: attio_list_deals
+```
 
 ### Validation
 
@@ -204,8 +227,8 @@ On load, the loader runs two phases of validation:
 
 **Phase 2 — Binding validation** (OpenClaw-specific):
 - Every tool in `requires.tools` has a binding in `bindings.yaml`
-- Every bound MCP server is configured and reachable
-- Warns (not errors) if operation names don't match between tool YAML and MCP server
+- For `type: mcp`: the bound MCP server is configured and reachable. Warns if operation names don't match between tool YAML and MCP server.
+- For `type: skill`: the skill is installed (ClawHub, `~/.openclaw/skills`, or workspace `skills/`) and passes gating checks (required bins, env vars, config). Warns if the skill is installed but not eligible.
 
 ## 4. State Management
 
@@ -254,6 +277,7 @@ The loader generates a session configuration:
 session:
   label: "expert:radiant-sales-expert"
   agentId: "radiant-sales-expert"
+  mode: "run"  # one-shot by default (see section 10, Q4)
 
   systemPrompt: |
     {assembled from step 2, including resolved policy tiers}
@@ -261,16 +285,14 @@ session:
   workspace: ~/.openclaw/workspace/expert-state/radiant-sales-expert/
 
   tools:
-    - mcp: hubspot-mcp
-    - mcp: nylas-mcp
+    - skill: attio           # CRM bound to a ClawHub skill
+    - mcp: nylas-mcp         # email bound to an MCP server
     - mcp: google-calendar-mcp
     - read   # for loading functions/knowledge/state on demand
     - write  # for updating state files and scratchpad
     - edit   # for surgical state updates
 
   model: "anthropic/claude-sonnet-4-20250514"  # configurable per expert
-
-  persistent: true  # keep session alive between tasks
 
   # from package execution defaults (can be overridden per process)
   execution:
@@ -426,7 +448,7 @@ The main agent needs to know what experts are available. The loader writes a reg
   - new_email (webhook/gmail) → inbound-email-triage [serial_per_key: contact_id]
   - opportunity_scan (cron: weekdays 8am AEST) → scan-for-opportunities [serial]
 - **Capabilities:** email classification, next-action determination, response composition
-- **Tools bound:** crm → hubspot-mcp, email → nylas-mcp, calendar → google-calendar-mcp
+- **Tools bound:** crm → attio (skill), email → nylas-mcp (mcp), calendar → google-calendar-mcp (mcp)
 - **Policy:** confirm by default, email.send and calendar.schedule_meeting are manual (draft-only)
 
 ## customer-success-expert
@@ -464,11 +486,17 @@ openclaw expert install https://github.com/openexperts/radiant-sales-expert
 # List installed experts
 openclaw expert list
 
-# Configure tool bindings
-openclaw expert bind radiant-sales-expert crm hubspot-mcp
+# Configure tool bindings (MCP server or ClawHub skill)
+openclaw expert bind radiant-sales-expert crm --skill attio
+openclaw expert bind radiant-sales-expert email --mcp nylas-mcp
+openclaw expert bind radiant-sales-expert calendar --mcp google-calendar-mcp
 
 # Validate a package (check bindings, tool availability)
 openclaw expert validate radiant-sales-expert
+
+# Update a package (git pull with SemVer safety checks)
+openclaw expert update radiant-sales-expert
+openclaw expert update --all
 
 # Remove a package
 openclaw expert remove radiant-sales-expert
@@ -485,17 +513,19 @@ openclaw expert run radiant-sales-expert "Triage this email: ..."
 # Install the expert package
 openclaw expert install https://github.com/openexperts/radiant-sales-expert
 
-# Bind tools (assumes MCP servers already configured)
-openclaw expert bind radiant-sales-expert crm hubspot-mcp
-openclaw expert bind radiant-sales-expert email nylas-mcp
-openclaw expert bind radiant-sales-expert calendar google-calendar-mcp
+# Bind tools — mix of ClawHub skills and MCP servers
+openclaw expert bind radiant-sales-expert crm --skill attio
+openclaw expert bind radiant-sales-expert email --mcp nylas-mcp
+openclaw expert bind radiant-sales-expert calendar --mcp google-calendar-mcp
 
 # Validate
 openclaw expert validate radiant-sales-expert
 # ✓ Package structure valid (spec 1.0)
 # ✓ Cross-references intact (triggers → processes → functions)
 # ✓ All required tools bound
-# ✓ MCP servers reachable
+#   crm → attio (skill, eligible ✓)
+#   email → nylas-mcp (mcp, reachable ✓)
+#   calendar → google-calendar-mcp (mcp, reachable ✓)
 # ✓ State files initialized
 # ✓ Triggers registered (new_email: webhook/gmail, opportunity_scan: cron)
 ```
@@ -561,14 +591,63 @@ Dylan: "What's my pipeline looking like?"
 
 3. **~~State conflicts~~** — The spec's concurrency model (`serial_per_key`) serializes operations per entity key, preventing concurrent writes to the same state. For the same expert, triggers with `serial_per_key` on `contact_id` guarantee no two processes for the same contact overlap. For user-initiated runs that bypass triggers, the loader should queue them behind any in-flight process for the same expert session. ✓
 
-### Still Open
+### Resolved by Loader Design
 
-4. **Persistent sessions vs. re-spawn:** Should expert sub-agents stay alive between tasks (lower latency, maintains conversation context) or spin up fresh each time (cleaner, cheaper)? The spec's `session: isolated` vs `session: main` on triggers covers the automatic case, but user-initiated routing (main agent delegates to expert) needs a decision. Probably configurable per expert.
+4. **~~Persistent sessions vs. re-spawn~~** — Default to one-shot (`mode: "run"`). Expert sub-agents spin up fresh for each task and announce their result back to the requester. ✓
 
-5. **Context from main agent:** When the main agent routes a task, how much context does it pass? Just the task, or also relevant user context (timezone, preferences, recent conversation)? Probably a slim context envelope.
+   **Trigger-invoked tasks**: `session: isolated` spawns a fresh `mode: "run"` session per invocation. `session: main` enqueues into the primary agent session. Both are already defined by the spec.
 
-6. **Package updates:** When the package author pushes a new version, how does that flow? `openclaw expert update`? Does it preserve runtime state files and bindings? The spec's SemVer guidance (MAJOR = breaking, MINOR = additions, PATCH = fixes) helps the loader decide whether an update is safe, but the migration mechanics are still undefined.
+   **User-initiated tasks**: The main agent uses `sessions_spawn` with `mode: "run"` by default. The expert does its work, announces the result, and the session archives per OpenClaw's `archiveAfterMinutes`.
 
-7. **Secrets/credentials:** Tool bindings may need auth. This should defer to OpenClaw's existing MCP server config rather than putting credentials in the expert package or bindings file.
+   **Why one-shot is the right default**: Expert continuity lives in **state files**, not conversation history. The persona and orchestrator are static package content reloaded each time. There is no inherent need to keep a session alive — the "memory" is already durable in `~/.openclaw/workspace/expert-state/<name>/state/`. One-shot sessions are cheaper (no idle context window), cleaner (no stale context), and simpler to reason about.
 
-8. **Approval UX:** When a `confirm`-tier operation pauses for human approval, what does the UX look like? Inline in the chat? A separate approval queue? What about batch approvals when a process has multiple confirm steps? The spec defines the semantics but the presentation is framework-specific.
+   **Interactive exception**: If the main agent judges a task is conversational (e.g., back-and-forth email drafting), it may spawn with `mode: "session"` and `thread: true` for follow-ups. This is the main agent's routing decision at invocation time, not a package-level declaration. The expert package does not need a `persistent` field.
+
+5. **~~Context from main agent~~** — Slim, structured context envelope. The main agent assembles it using its knowledge of the expert from EXPERTS.md. ✓
+
+   When the main agent routes a task via `sessions_spawn`, the `task` parameter should include a context envelope with:
+
+   - **`task`** (required): The specific instruction or question.
+   - **`user_context`** (optional): Lightweight user metadata — `timezone`, `name`, `preferences`. Already available in the main agent's session.
+   - **`conversation_excerpt`** (optional): The last few relevant messages the main agent selects. The main agent decides what's relevant — it does not dump the full conversation history.
+   - **`entity_hint`** (optional): Pre-fetched entity identifiers (e.g., contact email, deal ID) that save the expert a lookup.
+
+   The envelope stays minimal by design. The expert has its own tools to fetch what it needs. Passing the entire main session context would blow the expert's context window and create unnecessary coupling.
+
+   This is prompt engineering in the main agent's EXPERTS.md instructions, not loader machinery. The loader documents the recommended envelope shape; the main agent follows it.
+
+6. **~~Package updates~~** — Git-based update with SemVer-aware safety checks. State and bindings are always preserved. ✓
+
+   **Mechanics**:
+   - `openclaw expert update <name>` runs `git pull` in the package directory (`~/.openclaw/experts/<name>/`).
+   - Before applying, the loader compares the incoming `expert.yaml` version against the installed version using SemVer:
+     - **PATCH** (e.g., 0.1.0 → 0.1.1): Pull and reload. No user action needed.
+     - **MINOR** (e.g., 0.1.0 → 0.2.0): Pull and reload. Log new capabilities. Initialize any new state templates.
+     - **MAJOR** (e.g., 0.1.0 → 1.0.0): Warn the user and show a diff summary. Require `--force` to proceed.
+   - `openclaw expert update --all` updates all installed experts.
+
+   **State preservation**: Runtime state files at `~/.openclaw/workspace/expert-state/<name>/state/` are **never deleted** on update. New templates from the package are initialized at the runtime location. Changed templates do not overwrite existing runtime state — the user's data takes precedence.
+
+   **Binding preservation**: Bindings live at `~/.openclaw/expert-config/<name>/bindings.yaml`, outside the package directory. `git pull` cannot touch them. If the updated package adds new `requires.tools` entries, the loader warns that new bindings are needed.
+
+   **Trigger re-registration**: After update, the loader re-validates the package and re-registers triggers. Handlers for removed triggers are cleaned up. Changed triggers are re-wired.
+
+7. **~~Secrets/credentials~~** — Defer entirely to OpenClaw's existing auth model. No credentials in the expert layer. ✓
+
+   - Expert packages **never** contain credentials. Nor do bindings files.
+   - `bindings.yaml` maps abstract tools to implementation names (MCP server or skill). It contains no secrets.
+   - **MCP server auth** is configured via OpenClaw's existing mechanisms: `~/.openclaw/openclaw.json`, per-agent auth profiles at `~/.openclaw/agents/<agentId>/agent/auth-profiles.json`, or OpenClaw's OAuth flow.
+   - **Skill auth** is configured via OpenClaw's `skills.entries.<name>.apiKey` and `skills.entries.<name>.env` in `openclaw.json`, following the existing skill auth pattern.
+   - The loader validates at `openclaw expert validate` time that bound implementations have working auth.
+   - Expert tool YAML files may include a `requires_auth` string (e.g., `"OAuth2"`) as documentation for human readers, but this is informational only — the loader does not enforce it.
+
+8. **~~Approval UX~~** — Inline chat confirmations, one at a time, with structured events for future UIs. ✓
+
+   **Tier mapping for OpenClaw**:
+   - **`auto`**: Tool call executes immediately. No interception.
+   - **`confirm`**: The loader pauses execution and delivers an approval request inline in the main chat channel. The message includes: operation name, input summary, the expert's reasoning, and a clear approve/reject prompt. The user responds in chat. If `policy.approval.timeout` is set, a timer starts. On timeout, apply `on_timeout` behavior (`reject` or `escalate`).
+   - **`manual`**: The expert prepares a complete draft. The loader delivers it to the main chat with a "DRAFT — for your review" label. The step is marked complete immediately. The user executes the action themselves or discards it.
+
+   **Batch approvals**: Approvals are presented **one at a time**, matching the serial nature of process step execution. The agent pauses at each `confirm` step and waits. No batch mode for v1 — serial approval is simpler, safer, and easier to reason about.
+
+   **Future extensibility**: The loader should emit structured approval events (operation, inputs, expert name, reasoning, timestamp) so a future dedicated approval queue or dashboard UI can consume them. For v1, inline chat is the UX surface.
