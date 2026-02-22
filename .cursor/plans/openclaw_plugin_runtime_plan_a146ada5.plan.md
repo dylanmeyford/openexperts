@@ -154,7 +154,15 @@ flowchart TD
   - `openclaw expert bind <name> <tool> --mcp <server> | --skill <skill>`
   - `openclaw expert activate <name>`
   - `openclaw expert run <name> "<message>"`
-  - `openclaw expert doctor` (checks Lobster CLI on PATH, plugin health)
+  - `openclaw expert setup` (one-time: installs Lobster CLI, enables dependencies, configures allowlists)
+  - `openclaw expert doctor` (checks Lobster CLI on PATH, plugin health, config correctness)
+- Implement `openclaw expert setup` that:
+  - Checks for Lobster CLI on PATH; if missing, installs from `github.com/openclaw/lobster`
+  - Enables `llm-task` plugin in config (`plugins.entries.llm-task.enabled: true`)
+  - Adds `lobster` and `llm-task` to tool allowlist (`tools.alsoAllow`)
+  - Enables hooks if any expert has webhook triggers (`hooks.enabled: true`)
+  - Prompts for hooks token if not set
+  - Prints summary of what was configured and whether a gateway restart is needed
 - Add minimal plugin config shape:
   ```json
   {
@@ -376,8 +384,8 @@ The learning system is entirely plugin-managed (OpenClaw has no native equivalen
 
 ## Risks and Mitigations
 
-- **Lobster CLI availability**: Plugin requires Lobster on PATH. `expert doctor` checks this. Provide install instructions on failure.
-- **Process → Lobster compilation fidelity**: Process markdown is free-form; the compiler must handle variation. Start with structured checklist pattern (spec-recommended) and fail clearly on unparseable steps. Provide a fallback mode where the process runs as a full agent session (agent follows the markdown playbook) without Lobster.
+- **Lobster CLI availability**: Plugin requires Lobster on PATH. `openclaw expert setup` auto-installs it from the [openclaw/lobster](https://github.com/openclaw/lobster) repo. `expert doctor` verifies it's present and responsive. If auto-install fails (permissions, platform), provide manual install instructions.
+- **Process compilation fidelity**: The compiler targets the checklist pattern (`- [ ] Step ...`) which the spec requires for resumable processes (section 7). Processes without checklists are not spec-compliant for resumable execution; the compiler should reject them with a clear error pointing to the spec requirement.
 - **`llm-task` dependency**: Functions with complex judgment run via `llm-task` inside Lobster. Must be enabled (`plugins.entries.llm-task.enabled`) AND in tool allowlist. `expert doctor` checks both. If missing, activation fails with clear remediation steps.
 - **Sandbox incompatibility**: If sandbox is enabled with `network: "none"` (default), MCP server calls and external API tools will fail silently. `expert doctor` warns if sandbox is active. Document required sandbox config for expert packages (e.g., `sandbox.docker.network: "bridge"`).
 - **Context budget overflow**: Expert packages with many functions, processes, and knowledge files could generate a prompt that exceeds the context window. Track injected size and warn at activation. Use compact indexes (name + 1-line description) and defer full content to on-demand reads.
