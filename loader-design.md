@@ -1,33 +1,48 @@
 # OpenExperts → OpenClaw Loader Design
 
-Version: `draft-2`
+Version: `draft-3`
 
 ## Overview
 
-The loader bridges an openexperts package into an OpenClaw sub-agent session. It validates the package, assembles a system prompt (including resolved approval policy), binds abstract tools to concrete implementations (MCP servers or ClawHub skills), wires triggers to OpenClaw's event system with concurrency control, and enforces execution guarantees (timeout, retry, resumption) and delivery settings at runtime.
+The loader bridges an openexperts package into an OpenClaw sub-agent session. It validates the package, assembles a system prompt (including resolved approval policy), binds abstract tools to concrete implementations (MCP servers or ClawHub skills), wires triggers to OpenClaw's event system with concurrency control, **compiles spec processes into Lobster workflow files** for deterministic execution with native approval gates and resume tokens, and enforces delivery settings at runtime.
+
+### Why Lobster
+
+Validated against OpenClaw docs, the original plan's custom process executor and `before_tool_call` approval interception were architecturally unsound — OpenClaw plugin hooks cannot pause/resume execution for human approval. [Lobster](https://docs.openclaw.ai/tools/lobster) solves this natively:
+
+- **Approval gates**: `approval: required` on workflow steps pauses execution and returns a `resumeToken`
+- **Resume**: `action: "resume"` with the token continues from where it paused
+- **Deterministic pipelines**: multi-step tool sequences run as a single operation
+- **LLM steps**: `llm-task` plugin enables structured LLM calls within workflows (for spec functions like classify-email-intent)
+- **Timeouts + safety**: enforced by the Lobster runtime, not plugin code
 
 ## How It Works
 
 ```
-expert-package/          loader           OpenClaw
-─────────────────    ─────────────    ─────────────────
+expert-package/          loader                    OpenClaw
+─────────────────    ─────────────────    ─────────────────────
 expert.yaml        →  parse manifest
-                      ├─ validate    →  error / warn
-                      ├─ triggers    →  webhook / cron / channel handlers
-                      ├─ concurrency →  queue config per trigger
-                      ├─ execution   →  timeout / retry / resume policy
-                      ├─ delivery    →  output routing config
-                      ├─ policy      →  approval tier enforcement
+                      ├─ validate       →  error / warn
+                      ├─ triggers       →  cron API / hooks.mappings / message_received hook
+                      ├─ concurrency    →  custom queue (parallel/serial/serial_per_key)
+                      ├─ policy         →  approval tier map
                       ┘
 orchestrator.md    →  ┐
-persona/*.md       →  ├─ assemble   →  system prompt
+persona/*.md       →  ├─ assemble      →  system prompt (via before_prompt_build hook)
                       ┘
-functions/*.md     →  skill index   →  on-demand skills
-processes/*.md     →  skill index   →  on-demand skills
-tools/*.yaml       →  tool binding  →  MCP servers / ClawHub skills
-knowledge/*.md     →  context plan  →  preloaded / on-demand
-state/*.md         →  state init    →  workspace files
-scratch/           →  runtime dir   →  ephemeral process working files
+functions/*.md     →  skill index      →  on-demand skills
+processes/*.md     →  lobster compile  →  .lobster workflow files (with approval gates)
+tools/*.yaml       →  tool binding     →  MCP servers / ClawHub skills
+knowledge/*.md     →  context plan     →  preloaded / on-demand
+state/*.md         →  state init       →  workspace files
+scratch/           →  runtime dir      →  ephemeral process working files
+
+                    Runtime execution:
+                    trigger fires → concurrency check → lobster run <process>.lobster
+                                                        ├─ auto steps: execute immediately
+                                                        ├─ confirm steps: pause → resumeToken → chat approval → resume
+                                                        ├─ manual steps: pause → draft delivered → step done (never resumed)
+                                                        └─ llm-task steps: structured LLM calls for functions
 ```
 
 ## 1. Package Resolution
@@ -322,10 +337,10 @@ session:
 
 ### Execution Enforcement
 
-The loader wraps each process invocation with execution policy:
+The loader wraps each Lobster invocation with execution policy from the spec:
 
-1. **Timeout**: start a wall-clock timer. If the process hasn't completed within `execution.timeout`, treat it as a failure.
-2. **Retry**: on failure, check `retry.max_attempts`. If attempts remain, wait `delay` (with `backoff` strategy) and re-invoke. If `resume_from_execution_log` is true, inject step-completion context into the retry prompt so the agent resumes rather than restarts.
+1. **Timeout**: mapped to Lobster's `timeoutMs` parameter. If the workflow hasn't completed within `execution.timeout`, Lobster kills the subprocess and the plugin treats it as a failure.
+2. **Retry**: on failure, the plugin checks `retry.max_attempts`. If attempts remain, it waits `delay` (with `backoff` strategy) and re-invokes the Lobster pipeline. If `resume_from_execution_log` is true, Lobster's built-in resume mechanism handles continuation from the last completed step (via the resume token from the failed run, if available).
 3. **On failure**: when all retries are exhausted, apply `on_failure` — `escalate` notifies the main agent and user, `abandon` logs silently, `dead_letter` queues for manual review.
 
 Process-level `execution` overrides (from process frontmatter) take precedence over these package defaults for the specific process.
@@ -355,46 +370,183 @@ When a process completes:
 2. Route the output to `delivery.channel` — `main` delivers to the primary agent session.
 3. If a process declares an `sla` and the wall-clock time exceeds it, apply `sla_breach` — `warn` notifies the user, `escalate` flags for human attention.
 
-### Approval Enforcement
+### Approval Enforcement (via Lobster)
 
-The loader intercepts every tool call during execution:
+Approval gates are enforced at the Lobster workflow level, not by intercepting tool calls in plugin hooks. The process-to-Lobster compiler inserts `approval: required` on workflow steps based on the resolved policy tier for each tool operation.
 
-1. Look up the operation in the resolved approval map.
-2. **auto**: execute immediately, return result to agent.
-3. **confirm**: pause execution, present the proposed action (operation name, inputs, reasoning) to the user via the main chat channel. Wait for approval. On approval, execute and continue. On rejection or timeout, treat as a failed step and follow `on_failure`.
-4. **manual**: the agent prepares the action as a draft. The loader delivers the draft to the user via the escalation channel and marks the step complete. The agent never executes it.
+**Why Lobster instead of `before_tool_call`**: OpenClaw's `before_tool_call` plugin hook can intercept tool params/results, but it cannot pause execution, send a message to the user, wait for a response, and then resume — the async pause/approve/resume pattern required for `confirm`-tier operations. Lobster natively supports this via `approval: required` steps and resume tokens.
 
-## 6. Trigger Wiring
+**Tier enforcement in compiled workflows**:
 
-The loader reads `triggers` from the manifest and registers each one with OpenClaw's runtime.
+1. **auto**: Lobster step has no `approval` field. Executes immediately.
+2. **confirm**: Lobster step has `approval: required`. The workflow pauses and returns a `resumeToken` plus a preview of the proposed action. The plugin:
+   - Receives the `needs_approval` response from the Lobster tool.
+   - Delivers the approval request inline in the main chat channel (operation name, inputs, expert reasoning).
+   - Registers `/approve <id>` and `/reject <id>` auto-reply commands via `api.registerCommand()`.
+   - On approve: calls Lobster `resume` with `approve: true`. Execution continues.
+   - On reject or timeout: calls Lobster `resume` with `approve: false`. Treated as failed step → follows `execution.on_failure`.
+   - If `policy.approval.timeout` is set, a background service timer starts. On expiry, applies `on_timeout` (`reject` or `escalate`).
+3. **manual**: Lobster step has `approval: required` and is **never resumed**. The approval preview IS the draft. The plugin delivers the draft to the main chat with a "DRAFT — for your review" label and marks the step complete. The human executes the action themselves.
 
-### Trigger Types
+**Approval token management**: Pending approvals are stored at `{dataDir}/approvals/pending.json`. A background service (via `api.registerService()`) polls for timed-out approvals.
 
-**`webhook`** — The loader registers a webhook handler. When a preset is declared (e.g. `preset: gmail`), the loader uses OpenClaw's built-in handler for that event source (Gmail PubSub push notification). When `requires_tool` is declared instead, the loader expects the bound MCP server to provide the webhook endpoint.
+## 6. Process → Lobster Compilation
 
-**`cron`** — The loader registers an OpenClaw cron job using the trigger's `expr` and `tz`.
+The loader compiles spec processes into executable `.lobster` workflow files. This is the bridge between the spec's "markdown playbooks for an agent loop" and OpenClaw's deterministic execution runtime.
 
-**`channel`** — The loader registers a channel message handler. OpenClaw normalizes incoming channel messages into a standard payload shape (`sender_id`, `message_text`, `channel_name`).
+**The package remains code-free.** Expert authors write markdown processes with checklist steps. The loader generates `.lobster` files at activation time; the expert package never contains generated code.
 
-### Trigger → Process Invocation
+### Compilation Steps
+
+1. Parse process frontmatter (`name`, `trigger`, `inputs`, `outputs`, `functions`, `tools`, `scratchpad`, `execution`, `delivery`).
+2. Parse process body to extract ordered step checklist (`- [ ] Step ...`).
+3. For each step, determine the step type and generate the corresponding Lobster step:
+
+**Tool call steps** (e.g., "Fetch the inbound email using the `email` tool"):
+```yaml
+- id: fetch_email
+  command: openclaw.invoke --tool nylas_get_email --args-json '{"message_id":"$message_id"}'
+```
+The abstract tool name (`email`) and operation (`get_email`) are resolved via bindings to the concrete tool name (`nylas_get_email`). Operation mapping from `bindings.yaml` is applied if present.
+
+**Function invocation steps** (e.g., "Read and apply `classify-email-intent`"):
+```yaml
+- id: classify
+  command: openclaw.invoke --tool llm-task --action json --args-json '{
+    "prompt": "<full function body from functions/classify-email-intent.md>",
+    "input": {"email_body": "$fetch_email.json.body", "sender_context": "$fetch_contact.json"},
+    "schema": {"type": "object", "properties": {"intent": {"type": "string"}, ...}, "required": [...]}
+  }'
+  stdin: $fetch_email.json
+```
+The function's markdown body becomes the `llm-task` prompt. Declared `inputs` and `outputs` from frontmatter map to the `input` and `schema` fields.
+
+**State read/write steps** (e.g., "Open scratchpad", "Update state/pipeline.md"):
+```yaml
+- id: scratchpad
+  command: exec --shell 'cat scratch/triage-$message_id.md 2>/dev/null || echo "# Triage"'
+```
+
+4. Insert `approval: required` on steps that invoke tool operations at `confirm` or `manual` tier (resolved from `policy.approval`).
+5. Wire `stdin: $step.stdout` / `stdin: $step.json` for data flow between steps.
+6. Add `condition: $step.approved` gates after approval steps (for `confirm` tier; `manual` steps are terminal).
+7. Apply process-level `execution` overrides (timeout maps to Lobster `timeoutMs`).
+
+### Output
+
+Generated `.lobster` files live at `{dataDir}/compiled/<expert>/<process-name>.lobster`. They are regenerated on:
+- `openclaw expert activate`
+- Package update (`openclaw expert update`)
+- Binding change (`openclaw expert bind`)
+
+### Example: Compiled `inbound-email-triage.lobster`
+
+Source: `processes/inbound-email-triage.md` with its checklist steps.
+
+```yaml
+name: inbound-email-triage
+args:
+  message_id:
+    type: string
+steps:
+  - id: scratchpad
+    command: exec --shell 'cat scratch/triage-$message_id.md 2>/dev/null || echo "# Triage: $message_id"'
+
+  - id: fetch_email
+    command: openclaw.invoke --tool nylas_get_email --args-json '{"message_id":"$message_id"}'
+
+  - id: fetch_contact
+    command: openclaw.invoke --tool attio_find_person --args-json '{"email":"$fetch_email.json.sender"}'
+    stdin: $fetch_email.json
+
+  - id: fetch_deal
+    command: openclaw.invoke --tool attio_list_deals --args-json '{"contact_id":"$fetch_contact.json.contact_id"}'
+    stdin: $fetch_contact.json
+
+  - id: classify
+    command: openclaw.invoke --tool llm-task --action json --args-json '{
+      "prompt": "## Classify Email Intent\n\nGiven email body and sender CRM context, classify intent and urgency.\n\n### Decision Rules\n- If the sender is in a late deal stage and mentions a competitor, classify as objection and high.\n- If there has been >14 days of inactivity and the reply is short/hesitant, classify as churn_risk.\n- If the email asks product or technical details, classify as question.\n\n### Output\nReturn: Intent, Urgency, Reasoning, Confidence",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "intent": {"type": "string", "enum": ["objection","question","buying_signal","churn_risk","scheduling","other"]},
+          "urgency": {"type": "string", "enum": ["high","medium","low"]},
+          "reasoning": {"type": "string"},
+          "confidence": {"type": "string", "enum": ["high","medium","low"]}
+        },
+        "required": ["intent","urgency","reasoning","confidence"]
+      }
+    }'
+    stdin: $fetch_deal.json
+
+  - id: next_action
+    command: openclaw.invoke --tool llm-task --action json --args-json '{...determine-next-action...}'
+    stdin: $classify.json
+
+  - id: compose
+    command: openclaw.invoke --tool llm-task --action json --args-json '{...compose-response...}'
+    stdin: $next_action.json
+
+  - id: send_email
+    command: openclaw.invoke --tool nylas_send_email --args-json '{"draft":"$compose.json.draft_response"}'
+    stdin: $compose.json
+    approval: required
+    # manual tier: always pauses, preview IS the draft, never resumed
+
+  - id: create_note
+    command: openclaw.invoke --tool attio_create_note --args-json '{"contact_id":"$fetch_contact.json.contact_id","body":"Triage: $classify.json.intent ($classify.json.urgency)"}'
+```
+
+### Handling Isolated Functions
+
+Functions that declare `session: isolated` cannot be compiled into inline `llm-task` steps. Instead:
+
+1. The compiler generates a separate `.lobster` file for the function.
+2. The parent process step invokes it as a nested Lobster workflow.
+3. Only declared `outputs` are returned to the parent pipeline.
+4. Child working context is not merged back.
+
+### Compilation Limitations
+
+The compiler targets the **checklist pattern** (spec-recommended). Processes that use unstructured prose instead of `- [ ] Step ...` checklists cannot be auto-compiled and will require manual `.lobster` authoring or a fallback to full agent-session execution (where the agent follows the process as a playbook without Lobster).
+
+## 7. Trigger Wiring
+
+The loader reads `triggers` from the manifest and registers each one using OpenClaw's native mechanisms.
+
+### Trigger Types → OpenClaw Mechanisms
+
+**`webhook`** — Uses OpenClaw's `hooks.mappings` system. When a preset is declared (e.g. `preset: gmail`), the loader adds it to `hooks.presets` (e.g., `hooks.presets: ["gmail"]`). When `requires_tool` is declared instead, the loader creates a custom hook mapping under `hooks.mappings` that routes the payload to the expert's process. The webhook endpoint is `POST /hooks/<trigger-name>` with token auth.
+
+**`cron`** — Uses OpenClaw's built-in `cron.add` Gateway API. The loader creates a cron job per trigger:
+- `expr` + `tz` → `schedule.kind: "cron"`, `schedule.expr`, `schedule.tz`
+- `session: isolated` (default) → `sessionTarget: "isolated"` with `payload.kind: "agentTurn"` containing the Lobster pipeline invocation
+- `session: main` → `sessionTarget: "main"` with `payload.kind: "systemEvent"`
+- `delivery` → `delivery.mode: "announce"` with channel routing
+
+**`channel`** — Uses the `message_received` plugin hook. The loader registers a handler that matches incoming messages against expert trigger definitions (by channel, sender pattern, or content match). On match, the handler dispatches to the concurrency queue → Lobster pipeline.
+
+### Trigger → Lobster Process Invocation
 
 When a trigger fires:
 
-1. **Dedupe**: if `dedupe_key` is set, check whether an event with this key was already processed recently. Skip if duplicate.
-2. **Payload mapping**: resolve `payload_mapping` to map trigger payload fields to process input names.
-3. **Concurrency check**: apply the effective concurrency policy (see below).
-4. **Session creation**: if `session: isolated` (default), spawn a new sub-agent session. If `session: main`, enqueue into the primary agent session.
-5. **Process execution**: invoke the target process with resolved inputs, preloading any declared `context` files.
+1. **Dedupe**: if `dedupe_key` is set, check the plugin's LRU/TTL seen-keys map. Skip if key was processed within the `dedupeWindowMs` window.
+2. **Payload mapping**: resolve `payload_mapping` to map trigger payload fields to process input names (Lobster workflow `args`).
+3. **Concurrency check**: apply the effective concurrency policy (see below). If queued, hold until the lane is free.
+4. **Lobster invocation**: call the Lobster tool with `action: "run"`, `pipeline: "{dataDir}/compiled/<expert>/<process>.lobster"`, `argsJson` containing resolved inputs, and `timeoutMs` from execution policy.
+5. **Handle result**: if Lobster returns `ok` → deliver output per delivery settings. If `needs_approval` → enter approval flow (section 5). If error → apply retry policy.
 
-### Concurrency
+### Concurrency (Custom Queue)
 
-The loader applies concurrency policy per trigger. Each trigger inherits from `concurrency.default` in the manifest unless it declares its own override.
+OpenClaw's native cron has only `maxConcurrentRuns: 1` globally — insufficient for per-trigger and per-key concurrency modes. The loader implements its own concurrency manager via `api.registerService()`.
 
-**`parallel`** — each invocation runs immediately in its own session. No coordination.
+**`parallel`** — each invocation dispatches immediately. No coordination.
 
-**`serial`** — all invocations of this trigger queue globally. The loader maintains a per-trigger FIFO queue and processes one at a time.
+**`serial`** — all invocations of this trigger queue globally. The service maintains a per-trigger FIFO queue and processes one at a time.
 
-**`serial_per_key`** — invocations queue per grouping key. The loader resolves `concurrency_key` against the (possibly enriched) trigger payload. Invocations with the same key run in order; different keys run in parallel. If the key can't be resolved, fall back to `serial` for that invocation and log a warning.
+**`serial_per_key`** — invocations queue per grouping key. The service resolves `concurrency_key` against the (possibly enriched) trigger payload. Invocations with the same key run in order; different keys run in parallel. If the key can't be resolved, fall back to `serial` for that invocation and log a warning.
+
+Queue state is held in memory with overflow to `{dataDir}/queue/` for crash recovery.
 
 ```
 # Example: new_email trigger inherits serial_per_key on contact_id
@@ -405,29 +557,41 @@ The loader applies concurrency policy per trigger. Each trigger inherits from `c
 # → meanwhile, email from bob@megacorp.com runs in parallel (different key)
 ```
 
-### Example: Wired Triggers
+### Example: How Triggers Map to OpenClaw
 
 ```yaml
-# What the loader registers with OpenClaw runtime:
+# spec trigger:
+- name: new_email
+  type: webhook
+  preset: gmail
+  dedupe_key: message_id
+  session: isolated
+  concurrency: serial_per_key
+  concurrency_key: contact_id
+  payload_mapping:
+    message_id: messages[0].id
+  process: inbound-email-triage
 
-triggers:
-  - name: new_email
-    handler: webhook/gmail          # from preset: gmail
-    dedupe_key: message_id
-    concurrency: serial_per_key
-    concurrency_key: contact_id     # inherited from package-level concurrency
-    session: isolated
-    process: inbound-email-triage
-    payload_mapping:
-      message_id: messages[0].id
+# → OpenClaw webhook mapping (hooks.presets: ["gmail"])
+# → Plugin intercepts gmail webhook payload
+# → Dedupe check on message_id
+# → Concurrency queue: serial_per_key on enriched contact_id
+# → lobster run compiled/radiant-sales-expert/inbound-email-triage.lobster --args-json '{"message_id":"..."}'
 
-  - name: opportunity_scan
-    handler: cron
-    expr: "0 8 * * 1-5"
-    tz: Australia/Sydney
-    concurrency: serial             # override: global queue
-    session: isolated
-    process: scan-for-opportunities
+# spec trigger:
+- name: opportunity_scan
+  type: cron
+  expr: "0 8 * * 1-5"
+  tz: Australia/Sydney
+  session: isolated
+  concurrency: serial
+  process: scan-for-opportunities
+
+# → OpenClaw cron.add:
+#   schedule: { kind: "cron", expr: "0 8 * * 1-5", tz: "Australia/Sydney" }
+#   sessionTarget: "isolated"
+#   payload: { kind: "agentTurn", message: "lobster run ..." }
+#   delivery: { mode: "announce", channel: "last" }
 ```
 
 ## 7. Main Agent Integration
@@ -530,26 +694,30 @@ openclaw expert validate radiant-sales-expert
 # ✓ Triggers registered (new_email: webhook/gmail, opportunity_scan: cron)
 ```
 
-### Runtime (automatic — webhook trigger)
+### Runtime (automatic — webhook trigger via Lobster)
 
 ```
 [Gmail PubSub push] → new_email trigger fires
+  → Plugin intercepts via hooks.mappings
   → Dedupe check: message_id not seen → proceed
   → Concurrency check: serial_per_key on contact_id
     → No in-flight process for this contact → proceed
-  → Spawn isolated session for inbound-email-triage
-  → Open scratchpad at scratch/triage-{message_id}.md
-  → Fetch email via email.get_email (auto → executes immediately)
-  → Fetch contact via crm.get_contact (auto → executes immediately)
-  → Fetch deal via crm.get_deal (auto → executes immediately)
-  → Execute classify-email-intent (inline or isolated per function session mode) → buying_signal, high urgency
-  → Execute determine-next-action (inline or isolated per function session mode) → schedule demo, multi-thread
-  → Execute compose-response (inline or isolated per function session mode) → draft email
-  → email.send is MANUAL tier → draft delivered to user, step marked done
-  → crm.create_note (auto → executes immediately, logs triage summary)
-  → Update state/pipeline.md with deal movement
-  → Clean up scratchpad (success)
-  → Deliver to main agent (narrative + structured):
+  → Lobster tool call: { action: "run", pipeline: "compiled/radiant-sales-expert/inbound-email-triage.lobster", argsJson: '{"message_id":"..."}', timeoutMs: 600000 }
+  → Lobster executes deterministic pipeline:
+    → fetch_email via nylas_get_email (auto → no approval gate)
+    → fetch_contact via attio_find_person (auto)
+    → fetch_deal via attio_list_deals (auto)
+    → classify via llm-task (structured LLM call with classify-email-intent prompt) → buying_signal, high urgency
+    → next_action via llm-task → schedule demo, multi-thread
+    → compose via llm-task → draft email
+    → send_email via nylas_send_email — MANUAL tier → approval: required
+  → Lobster returns: { status: "needs_approval", resumeToken: "...", output: { draft: "..." } }
+  → Plugin delivers draft to main chat: "📝 DRAFT — Email to Sarah at Acme (for your review):\n..."
+  → Step marked done (manual tier — never resumed)
+  → Lobster continues remaining steps:
+    → create_note via attio_create_note (auto)
+  → Lobster returns: { status: "ok", output: { classification: {...}, recommended_action: {...} } }
+  → Plugin delivers to main agent (narrative + structured):
     "Buying signal from Sarah at Acme (Stage 3, $45k).
      She's asking about enterprise pricing — looks ready to move.
      Draft reply ready for your review. Recommend scheduling demo
@@ -557,18 +725,34 @@ openclaw expert validate radiant-sales-expert
   → Main agent relays to Dylan via chat
 ```
 
+### Runtime (automatic — confirm approval via Lobster)
+
+```
+[Trigger fires] → Lobster pipeline reaches crm.update_deal_stage (confirm tier)
+  → Lobster returns: { status: "needs_approval", resumeToken: "tok_abc123",
+      requiresApproval: { prompt: "Update Acme deal to Stage 4?", items: [{...}] } }
+  → Plugin delivers approval request to main chat:
+    "⏸️ Approval needed: Update Acme deal stage to Stage 4 (Negotiation)
+     Reason: Buying signal detected, demo scheduled.
+     Reply /approve tok_abc123 or /reject tok_abc123"
+  → Approval timeout timer starts (24h per policy)
+  → User replies: /approve tok_abc123
+  → Plugin calls Lobster: { action: "resume", token: "tok_abc123", approve: true }
+  → Lobster continues pipeline from where it paused
+  → Process completes normally
+```
+
 ### Runtime (automatic — failure with retry)
 
 ```
 [Gmail PubSub push] → new_email trigger fires
-  → Spawn isolated session for inbound-email-triage
-  → Open scratchpad, fetch email, fetch contact... (steps 1-3 complete)
-  → crm.get_deal fails (API timeout)
-  → Scratchpad preserved with steps 1-3 results
-  → Retry attempt 2 (after 30s backoff)
-    → Read scratchpad → resume from step 4
-    → crm.get_deal succeeds → continue
-    → Process completes normally
+  → Lobster pipeline starts, completes steps 1-3 (fetch_email, fetch_contact, fetch_deal)
+  → fetch_deal fails (API timeout)
+  → Lobster returns: { status: "error", error: "timeout on step fetch_deal" }
+  → Plugin checks retry policy: attempt 1 of 3, backoff: 30s
+  → After 30s delay, re-invokes Lobster pipeline
+    → Lobster re-executes from step 1 (idempotent: false → relies on scratchpad if present)
+    → fetch_deal succeeds → pipeline continues to completion
 ```
 
 ### Runtime (user-initiated)
@@ -641,13 +825,27 @@ Dylan: "What's my pipeline looking like?"
    - The loader validates at `openclaw expert validate` time that bound implementations have working auth.
    - Expert tool YAML files may include a `requires_auth` string (e.g., `"OAuth2"`) as documentation for human readers, but this is informational only — the loader does not enforce it.
 
-8. **~~Approval UX~~** — Inline chat confirmations, one at a time, with structured events for future UIs. ✓
+8. **~~Approval UX~~** — Lobster-native approval gates with inline chat UX. ✓
 
-   **Tier mapping for OpenClaw**:
-   - **`auto`**: Tool call executes immediately. No interception.
-   - **`confirm`**: The loader pauses execution and delivers an approval request inline in the main chat channel. The message includes: operation name, input summary, the expert's reasoning, and a clear approve/reject prompt. The user responds in chat. If `policy.approval.timeout` is set, a timer starts. On timeout, apply `on_timeout` behavior (`reject` or `escalate`).
-   - **`manual`**: The expert prepares a complete draft. The loader delivers it to the main chat with a "DRAFT — for your review" label. The step is marked complete immediately. The user executes the action themselves or discards it.
+   **Tier mapping via Lobster**:
+   - **`auto`**: Lobster step has no `approval` field. Executes immediately.
+   - **`confirm`**: Lobster step has `approval: required`. Pipeline pauses and returns a `resumeToken`. The plugin delivers the approval request inline in the main chat channel (operation name, inputs, reasoning) and registers `/approve <id>` and `/reject <id>` auto-reply commands. On approve, the plugin calls `lobster resume --approve true`. On reject or timeout, calls `lobster resume --approve false` → follows `on_failure`.
+   - **`manual`**: Lobster step has `approval: required` but is **never resumed**. The preview IS the draft. The plugin delivers the draft to the main chat with a "DRAFT — for your review" label and marks the step complete.
 
-   **Batch approvals**: Approvals are presented **one at a time**, matching the serial nature of process step execution. The agent pauses at each `confirm` step and waits. No batch mode for v1 — serial approval is simpler, safer, and easier to reason about.
+   **Why Lobster instead of custom interception**: The original plan assumed `before_tool_call` could pause/resume agent execution for human approval. OpenClaw docs confirmed this hook can intercept tool params/results but cannot implement async pause/approve/resume patterns. Lobster solves this natively.
 
-   **Future extensibility**: The loader should emit structured approval events (operation, inputs, expert name, reasoning, timestamp) so a future dedicated approval queue or dashboard UI can consume them. For v1, inline chat is the UX surface.
+   **Batch approvals**: Approvals are presented **one at a time**, matching the serial nature of Lobster pipeline execution. No batch mode for v1.
+
+   **Future extensibility**: The plugin emits structured approval events (operation, inputs, expert name, reasoning, timestamp, resume token) so a future dedicated approval queue or dashboard UI can consume them. For v1, inline chat + `/approve` commands are the UX surface.
+
+9. **~~Process execution engine~~** — Lobster-based compilation, not custom executor. ✓
+
+   The original plan called for a custom process executor with timeout, retry, resume, and delivery handling. Validated against OpenClaw docs, this is replaced by:
+
+   - **Process compilation**: spec processes (markdown playbooks with checklist steps) are compiled into `.lobster` workflow files at activation time.
+   - **Lobster execution**: the Lobster tool runs compiled workflows with deterministic step execution, JSON piping between steps, and native approval gates.
+   - **LLM judgment steps**: functions that require LLM reasoning (classify, compose, determine) use the `llm-task` plugin within Lobster pipelines for structured outputs.
+   - **Timeout/retry**: `timeoutMs` is handled by Lobster; retry with backoff is managed by the plugin wrapper.
+   - **Resume**: Lobster resume tokens handle continuation from paused (approval) states. For failure retry, the plugin re-invokes the full pipeline (scratchpad provides domain-level state recovery).
+
+   **Dependency**: Lobster CLI must be installed on the Gateway host. The `llm-task` plugin must be enabled. Both are validated at `openclaw expert doctor` time.
