@@ -21,28 +21,6 @@ export interface OpenClawPluginApi {
     requireAuth?: boolean;
     handler: (ctx: { args?: string; channel?: string; senderId?: string }) => Promise<{ text: string }> | { text: string };
   }) => void;
-  registerHook?: (hook: {
-    id: string;
-    event: string;
-    handler: (event: unknown) => Promise<void> | void;
-  }) => void;
-  runtime?: {
-    updateConfig?: (patch: Record<string, unknown>) => Promise<void>;
-    addCronJob?: (job: {
-      id: string;
-      expr: string;
-      tz?: string;
-      payload?: Record<string, unknown>;
-    }) => Promise<void>;
-    removeCronJob?: (id: string) => Promise<void>;
-    addWebhookMapping?: (mapping: {
-      id: string;
-      preset?: string;
-      requiresTool?: string;
-      payload?: Record<string, unknown>;
-    }) => Promise<void>;
-    removeWebhookMapping?: (id: string) => Promise<void>;
-  };
 }
 
 export interface CommandRegistry {

@@ -21,15 +21,11 @@ describe("runtime flow", () => {
       registerCli: () => undefined,
       registerService: () => undefined,
       registerCommand: () => undefined,
-      runtime: {
-        addCronJob: async () => undefined,
-        removeCronJob: async () => undefined,
-        addWebhookMapping: async () => undefined,
-        removeWebhookMapping: async () => undefined,
-      },
     };
 
-    const runtime = new OpenExpertsRuntime(api, { dataDir });
+    const openclawConfigPath = path.join(dataDir, "openclaw.json");
+    await fs.writeFile(openclawConfigPath, "{}", "utf8");
+    const runtime = new OpenExpertsRuntime(api, { dataDir, openclawConfigPath });
     await runtime.boot();
     expect(await runtime.install(sourceDir)).toContain("Installed");
     expect(await runtime.list()).toContain("demo-expert");

@@ -1,0 +1,49 @@
+name: calendar
+description: Calendar access for availability checks and meeting scheduling
+operations:
+  - name: check_availability
+    description: Check calendar availability for a given time range
+    approval: auto
+    input:
+      type: object
+      properties:
+        start_date:
+          type: string
+        end_date:
+          type: string
+    output:
+      type: object
+      properties:
+        available_slots:
+          type: array
+          items:
+            type: object
+            properties:
+              start:
+                type: string
+              end:
+                type: string
+
+  - name: schedule_meeting
+    description: Schedule a meeting with attendees
+    approval: manual
+    input:
+      type: object
+      properties:
+        title:
+          type: string
+        start:
+          type: string
+        end:
+          type: string
+        attendees:
+          type: array
+          items:
+            type: string
+    output:
+      type: object
+      properties:
+        event_id:
+          type: string
+        status:
+          type: string

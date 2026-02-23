@@ -28,6 +28,11 @@
   "openclaw": {
     "extensions": [
       "./dist/index.js"
+    ],
+    "hooks": [
+      "./hooks/openexperts-gateway-startup",
+      "./hooks/openexperts-message-received",
+      "./hooks/openexperts-before-prompt-build"
     ]
   }
 }

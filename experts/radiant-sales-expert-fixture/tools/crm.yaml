@@ -1,0 +1,86 @@
+name: crm
+description: Customer relationship management interface
+operations:
+  - name: get_contact
+    description: Retrieve a contact by email address
+    approval: auto
+    input:
+      type: object
+      properties:
+        email:
+          type: string
+    output:
+      type: object
+      properties:
+        contact_id:
+          type: string
+        name:
+          type: string
+        company:
+          type: string
+        deal_stage:
+          type: string
+        last_activity:
+          type: string
+        notes:
+          type: array
+          items:
+            type: string
+
+  - name: get_deal
+    description: Retrieve active deal details for a contact
+    approval: auto
+    input:
+      type: object
+      properties:
+        contact_id:
+          type: string
+    output:
+      type: object
+      properties:
+        deal_name:
+          type: string
+        amount:
+          type: number
+        stage:
+          type: string
+        competitors:
+          type: array
+          items:
+            type: string
+        close_date:
+          type: string
+
+  - name: update_deal_stage
+    description: Update the stage of an active deal
+    approval: confirm
+    input:
+      type: object
+      properties:
+        deal_id:
+          type: string
+        stage:
+          type: string
+        reason:
+          type: string
+    output:
+      type: object
+      properties:
+        success:
+          type: boolean
+
+  - name: create_note
+    description: Create a note on a contact record
+    approval: auto
+    input:
+      type: object
+      properties:
+        contact_id:
+          type: string
+        body:
+          type: string
+    output:
+      type: object
+      properties:
+        note_id:
+          type: string

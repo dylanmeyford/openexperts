@@ -6,6 +6,7 @@ export interface RuntimeConfig {
   dedupeWindowMs: number;
   approvalPollMs: number;
   lobsterTimeoutMs: number;
+  openclawConfigPath?: string;
 }
 
 export function resolveConfig(raw: unknown): RuntimeConfig {
@@ -15,6 +16,9 @@ export function resolveConfig(raw: unknown): RuntimeConfig {
     dedupeWindowMs: input.dedupeWindowMs ?? 60 * 60 * 1000,
     approvalPollMs: input.approvalPollMs ?? 5000,
     lobsterTimeoutMs: (input as { lobsterTimeoutMs?: number }).lobsterTimeoutMs ?? 10 * 60 * 1000,
+    openclawConfigPath: typeof (input as { openclawConfigPath?: unknown }).openclawConfigPath === "string"
+      ? expandHome((input as { openclawConfigPath: string }).openclawConfigPath)
+      : undefined,
   };
 }
 

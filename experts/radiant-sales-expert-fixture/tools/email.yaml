@@ -1,0 +1,42 @@
+name: email
+description: Email access for reading and sending messages
+operations:
+  - name: get_email
+    description: Retrieve an email by message ID
+    approval: auto
+    input:
+      type: object
+      properties:
+        message_id:
+          type: string
+    output:
+      type: object
+      properties:
+        from:
+          type: string
+        subject:
+          type: string
+        body:
+          type: string
+        date:
+          type: string
+
+  - name: send
+    description: Send an email (draft delivery for human review)
+    approval: manual
+    input:
+      type: object
+      properties:
+        to:
+          type: string
+        subject:
+          type: string
+        body:
+          type: string
+    output:
+      type: object
+      properties:
+        message_id:
+          type: string
+        status:
+          type: string

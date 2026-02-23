@@ -63,29 +63,7 @@ export default function register(api: OpenClawPluginApi): void {
     });
   }
 
-  if (api.registerHook) {
-    api.registerHook({
-      id: "openexperts-gateway-startup",
-      event: "gateway:startup",
-      handler: async () => {
-        await runtime.onGatewayStartup();
-      },
-    });
-    api.registerHook({
-      id: "openexperts-message-received",
-      event: "message:received",
-      handler: async (event) => {
-        await runtime.onMessageReceived(event);
-      },
-    });
-    api.registerHook({
-      id: "openexperts-before-prompt-build",
-      event: "before_prompt_build",
-      handler: async (event) => {
-        await runtime.beforePromptBuild(event);
-      },
-    });
-  }
-
   registerCli(api, runtime);
+
+  (globalThis as { __openexpertsRuntime?: OpenExpertsRuntime }).__openexpertsRuntime = runtime;
 }

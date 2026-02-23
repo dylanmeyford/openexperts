@@ -1,0 +1,102 @@
+spec: "1.0"
+name: radiant-sales-expert
+version: "0.1.0"
+description: B2B sales expertise for inbound deal triage and next-best-action
+author: Openexperts Community
+license: MIT
+
+requires:
+  tools:
+    - crm
+    - email
+    - calendar
+
+concurrency:
+  default: serial_per_key
+  key: contact_id
+
+policy:
+  approval:
+    default: confirm
+    timeout: 24h
+    on_timeout: escalate
+    overrides:
+      crm.get_contact: auto
+      crm.get_deal: auto
+      crm.create_note: auto
+      email.get_email: auto
+      crm.update_deal_stage: confirm
+      email.send: manual
+      calendar.schedule_meeting: manual
+  escalation:
+    channel: main
+    on_low_confidence: true
+    on_manual_ready: true
+
+execution:
+  timeout: 10m
+  idempotent: false
+  retry:
+    max_attempts: 3
+    backoff: exponential
+    delay: 30s
+  on_failure: escalate
+  resume_from_execution_log: true
+
+delivery:
+  format: both
+  channel: main
+  sla_breach: warn
+
+outputs:
+  - email drafts
+  - deal triage reports
+  - pipeline summaries
+
+triggers:
+  - name: new_email
+    type: webhook
+    preset: gmail
+    dedupe_key: message_id
+    session: isolated
+    payload_mapping:
+      message_id: messages[0].id
+    process: inbound-email-triage
+    description: Fires when a new email arrives in the monitored inbox.
+
+  - name: opportunity_scan
+    type: cron
+    expr: "0 8 * * 1-5"
+    tz: Australia/Sydney
+    session: isolated
+    concurrency: serial
+    process: scan-for-opportunities
+    description: Runs every weekday morning to scan for new signals on active accounts.
+
+learning:
+  enabled: true
+  approval: confirm
+  max_entries_per_file: 50
+
+components:
+  orchestrator: orchestrator.md
+  persona:
+    - persona/identity.md
+    - persona/rules.md
+  functions:
+    - functions/classify-email-intent.md
+    - functions/determine-next-action.md
+    - functions/compose-response.md
+  processes:
+    - processes/inbound-email-triage.md
+    - processes/scan-for-opportunities.md
+  tools:
+    - tools/crm.yaml
+    - tools/email.yaml
+    - tools/calendar.yaml
+  knowledge:
+    - knowledge/meddpicc.md
+    - knowledge/competitive-battle-cards.md
+  state:
+    - state/pipeline.md
+    - state/session-notes.md

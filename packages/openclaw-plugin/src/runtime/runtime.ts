@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { resolveConfig, getRuntimePaths, type RuntimeConfig, type RuntimePaths } from "../config.js";
 import type { OpenClawPluginApi } from "../openclaw-types.js";
@@ -17,7 +18,7 @@ import { TriggerAdapter } from "./trigger-adapter.js";
 import { LearningService } from "./learning.js";
 import { writeExpertsRegistry } from "../registry/experts-md.js";
 import type { BindingFile, ExpertManifest, ToolBinding } from "../types.js";
-import { ensureDir, exists, writeUtf8 } from "../fs-utils.js";
+import { ensureDir, exists, readJson, writeUtf8 } from "../fs-utils.js";
 
 export class OpenExpertsRuntime {
   readonly cfg: RuntimeConfig;
@@ -49,7 +50,7 @@ export class OpenExpertsRuntime {
       }
       await this.run(expert, trigger.process, JSON.stringify(payload));
     }, path.join(this.cfg.dataDir, "dedupe-state.json"));
-    this.triggerAdapter = new TriggerAdapter(this.api, this.cfg.dataDir);
+    this.triggerAdapter = new TriggerAdapter(this.cfg.dataDir, this.cfg.openclawConfigPath);
   }
 
   async boot(): Promise<void> {
@@ -126,7 +127,7 @@ export class OpenExpertsRuntime {
     await initializeStateTemplates(expertDir, this.paths.stateDir, manifest.name);
     await compileExpertProcessesToLobster(expertDir, this.paths.compiledDir, manifest, bindings);
     await this.triggerRuntime.activateManifest(manifest);
-    await this.triggerAdapter.registerForManifest(manifest);
+    const triggerResult = await this.triggerAdapter.registerForManifest(manifest);
     this.activeManifests.set(manifest.name, manifest);
 
     const learningSnippet = await this.learningService.loadScopeLearnings(manifest.name, "package");
@@ -138,7 +139,20 @@ export class OpenExpertsRuntime {
     });
     await writeUtf8(path.join(this.paths.stateDir, manifest.name, "SYSTEM_PROMPT.md"), prompt);
     await this.refreshRegistry();
-    return `Activated ${manifest.name}.`;
+
+    const lines = [`Activated ${manifest.name}.`];
+    if (triggerResult.applied.length > 0) {
+      lines.push("");
+      lines.push("Config changes applied to openclaw.json:");
+      for (const entry of triggerResult.applied) {
+        lines.push(`  + ${entry.section}.${entry.key}: ${entry.description}`);
+      }
+    }
+    if (triggerResult.needsRestart) {
+      lines.push("");
+      lines.push("Restart the gateway to activate triggers.");
+    }
+    return lines.join("\n");
   }
 
   async bindingWizard(expertName: string): Promise<string> {
@@ -344,38 +358,31 @@ export class OpenExpertsRuntime {
       lobster = await checkCommandVersion("lobster", ["--version"]);
     }
     checks.push(`lobster: ${lobster}`);
-    const llmEnabled = configPathBoolean(this.api.config, ["plugins", "entries", "llm-task", "enabled"]);
-    const allow = configPathArray(this.api.config, ["tools", "alsoAllow"]);
-    const hasLobster = allow.includes("lobster");
-    const hasLlmTask = allow.includes("llm-task");
-    checks.push(`llm-task enabled: ${llmEnabled}`);
-    checks.push(`tools.alsoAllow contains lobster: ${hasLobster}`);
-    checks.push(`tools.alsoAllow contains llm-task: ${hasLlmTask}`);
-    const webhookNeeded = await this.anyWebhookTriggers();
-    if (this.api.runtime?.updateConfig) {
-      const nextAllow = Array.from(new Set([...allow, "lobster", "llm-task"]));
-      await this.api.runtime.updateConfig({
-        tools: { alsoAllow: nextAllow },
-        plugins: {
-          entries: {
-            "llm-task": { enabled: true },
-          },
-        },
-        ...(webhookNeeded
-          ? {
-              hooks: {
-                enabled: true,
-              },
-            }
-          : {}),
-      });
-      checks.push("Applied config patch: enabled llm-task and allowlisted lobster/llm-task.");
-      if (webhookNeeded) {
-        checks.push("Webhook triggers detected: enabled hooks. Ensure hooks token is configured.");
-      }
-    } else {
-      checks.push("Runtime config patch API unavailable; apply config manually.");
+
+    const configPath = this.cfg.openclawConfigPath ?? resolveOpenClawConfigPath();
+    const config = await readJson<Record<string, unknown>>(configPath, {});
+
+    ensureDeep(config, ["plugins", "entries", "llm-task", "enabled"], true);
+    const alsoAllow = ensureArray(config, ["tools", "alsoAllow"]);
+    if (!alsoAllow.includes("lobster")) {
+      alsoAllow.push("lobster");
     }
+    if (!alsoAllow.includes("llm-task")) {
+      alsoAllow.push("llm-task");
+    }
+
+    const webhookNeeded = await this.anyWebhookTriggers();
+    if (webhookNeeded) {
+      ensureDeep(config, ["hooks", "enabled"], true);
+      checks.push("Webhook triggers detected: enabled hooks. Ensure hooks token is configured.");
+    }
+
+    await writeUtf8(configPath, JSON.stringify(config, null, 2));
+    checks.push(`Applied config to ${configPath}:`);
+    checks.push("  + plugins.entries.llm-task.enabled: true");
+    checks.push("  + tools.alsoAllow: lobster, llm-task");
+    checks.push("");
+    checks.push("Restart the gateway to apply changes.");
     return checks.join("\n");
   }
 
@@ -595,4 +602,45 @@ function appendPromptContext(event: unknown, context: string): void {
     return;
   }
   e.context.prependContext = [...(e.context.prependContext ?? []), context];
+}
+
+function resolveOpenClawConfigPath(): string {
+  const envPath = process.env.OPENCLAW_CONFIG;
+  if (envPath) {
+    return envPath;
+  }
+  return path.join(os.homedir(), ".openclaw", "openclaw.json");
+}
+
+function ensureDeep(obj: Record<string, unknown>, keys: string[], value: unknown): void {
+  let current = obj;
+  for (let i = 0; i < keys.length - 1; i += 1) {
+    const key = keys[i];
+    if (!current[key] || typeof current[key] !== "object" || Array.isArray(current[key])) {
+      current[key] = {};
+    }
+    current = current[key] as Record<string, unknown>;
+  }
+  current[keys[keys.length - 1]] = value;
+}
+
+function ensureArray(obj: Record<string, unknown>, keys: string[]): string[] {
+  let current: unknown = obj;
+  for (let i = 0; i < keys.length - 1; i += 1) {
+    const key = keys[i];
+    if (!current || typeof current !== "object") {
+      return [];
+    }
+    const rec = current as Record<string, unknown>;
+    if (!rec[key] || typeof rec[key] !== "object") {
+      rec[key] = {};
+    }
+    current = rec[key];
+  }
+  const lastKey = keys[keys.length - 1];
+  const rec = current as Record<string, unknown>;
+  if (!Array.isArray(rec[lastKey])) {
+    rec[lastKey] = [];
+  }
+  return rec[lastKey] as string[];
 }
