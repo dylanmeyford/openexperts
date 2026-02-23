@@ -65,5 +65,17 @@ export default function register(api: OpenClawPluginApi): void {
 
   registerCli(api, runtime);
 
+  if (api.registerHook) {
+    api.registerHook("gateway:startup", async () => {
+      await runtime.onGatewayStartup();
+    });
+    api.registerHook("message:received", async (event) => {
+      await runtime.onMessageReceived(event);
+    });
+    api.registerHook("agent:bootstrap", async (event) => {
+      await runtime.beforePromptBuild(event);
+    });
+  }
+
   (globalThis as { __openexpertsRuntime?: OpenExpertsRuntime }).__openexpertsRuntime = runtime;
 }

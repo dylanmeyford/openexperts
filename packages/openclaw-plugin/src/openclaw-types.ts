@@ -1,9 +1,21 @@
 export interface OpenClawPluginApi {
   config?: Record<string, unknown>;
+  registerHook?: (event: string, handler: (event: unknown) => Promise<void> | void) => void;
+  registerPluginHooksFromDir?: (hooksDir: string) => void;
   logger: {
     info: (msg: string, meta?: unknown) => void;
     warn: (msg: string, meta?: unknown) => void;
     error: (msg: string, meta?: unknown) => void;
+  };
+  cron?: {
+    add?: (job: OpenClawCronJob) => Promise<unknown> | unknown;
+    remove?: (id: string) => Promise<unknown> | unknown;
+  };
+  gateway?: {
+    cron?: {
+      add?: (job: OpenClawCronJob) => Promise<unknown> | unknown;
+      remove?: (id: string) => Promise<unknown> | unknown;
+    };
   };
   registerCli: (
     registerer: (ctx: { program: CommandRegistry }) => void,
@@ -21,6 +33,26 @@ export interface OpenClawPluginApi {
     requireAuth?: boolean;
     handler: (ctx: { args?: string; channel?: string; senderId?: string }) => Promise<{ text: string }> | { text: string };
   }) => void;
+}
+
+export interface OpenClawCronJob {
+  id: string;
+  schedule: {
+    kind: "cron";
+    expr: string;
+    tz: string;
+  };
+  sessionTarget: "main" | "isolated";
+  payload: {
+    kind: "systemEvent";
+    expert: string;
+    trigger: string;
+    process: string;
+  };
+  delivery: {
+    mode: "announce";
+  };
+  task?: string;
 }
 
 export interface CommandRegistry {

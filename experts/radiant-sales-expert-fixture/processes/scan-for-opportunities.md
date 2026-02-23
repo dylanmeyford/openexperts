@@ -17,7 +17,8 @@ Run this process every weekday morning to review active deals for new signals.
 - [ ] Read `state/pipeline.md` to load current deal context.
 - [ ] Scan active deals via `crm.get_deal` for each tracked account.
 - [ ] Identify stalled or at-risk deals (no activity >7 days, missed close dates, competitor mentions).
-- [ ] Update `state/pipeline.md` with new risk flags and status changes.
+- [ ] Use `functions/determine-next-action` to determine the next best action for this deal. 
+- [ ] Update `state/pipeline.md` with new risk flags, status changes and next best step.
 
 ### Completion
 

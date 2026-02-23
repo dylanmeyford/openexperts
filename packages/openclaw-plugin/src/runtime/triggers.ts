@@ -51,7 +51,7 @@ export class TriggerRuntime {
     const queueKey = typeof keyValue === "string" || typeof keyValue === "number" ? String(keyValue) : undefined;
 
     await this.queue.enqueue(mode, trigger.name, queueKey, async () => {
-      await this.invokeProcess(trigger, context.payload);
+      await this.invokeProcess(trigger, applyPayloadMapping(context.payload, trigger.payload_mapping));
     });
   }
 
@@ -85,13 +85,53 @@ export class TriggerRuntime {
 }
 
 function getByPath(payload: Record<string, unknown>, dotPath: string): unknown {
-  const parts = dotPath.split(".");
+  const parts = parsePath(dotPath);
   let current: unknown = payload;
   for (const part of parts) {
     if (!current || typeof current !== "object") {
       return undefined;
     }
+    if (typeof part === "number") {
+      if (!Array.isArray(current) || part < 0 || part >= current.length) {
+        return undefined;
+      }
+      current = current[part];
+      continue;
+    }
     current = (current as Record<string, unknown>)[part];
   }
   return current;
+}
+
+function applyPayloadMapping(
+  payload: Record<string, unknown>,
+  mapping: Record<string, string> | undefined,
+): Record<string, unknown> {
+  if (!mapping || Object.keys(mapping).length === 0) {
+    return payload;
+  }
+  const mapped: Record<string, unknown> = {};
+  for (const [inputName, payloadPath] of Object.entries(mapping)) {
+    const value = getByPath(payload, payloadPath);
+    if (value !== undefined) {
+      mapped[inputName] = value;
+    }
+  }
+  return { ...payload, ...mapped };
+}
+
+function parsePath(input: string): Array<string | number> {
+  const parts: Array<string | number> = [];
+  const re = /([^[.\]]+)|\[(\d+)\]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(input)) !== null) {
+    if (match[1]) {
+      parts.push(match[1]);
+      continue;
+    }
+    if (match[2]) {
+      parts.push(Number(match[2]));
+    }
+  }
+  return parts;
 }

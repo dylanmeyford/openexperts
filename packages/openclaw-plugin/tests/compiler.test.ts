@@ -41,5 +41,8 @@ description: test
     const file = await fs.readFile(out[0].outputPath, "utf8");
     expect(file).toContain("name: inbound-triage");
     expect(file).toContain("step_1");
+    expect(file).toContain("openexperts-exec.mjs");
+    expect(file).not.toContain("openclaw.invoke");
+    expect(file).not.toContain("run-binding");
   });
 });

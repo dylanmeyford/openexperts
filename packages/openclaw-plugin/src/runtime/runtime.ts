@@ -50,7 +50,7 @@ export class OpenExpertsRuntime {
       }
       await this.run(expert, trigger.process, JSON.stringify(payload));
     }, path.join(this.cfg.dataDir, "dedupe-state.json"));
-    this.triggerAdapter = new TriggerAdapter(this.cfg.dataDir, this.cfg.openclawConfigPath);
+    this.triggerAdapter = new TriggerAdapter(this.cfg.dataDir, this.cfg.openclawConfigPath, this.api);
   }
 
   async boot(): Promise<void> {
@@ -151,6 +151,13 @@ export class OpenExpertsRuntime {
     if (triggerResult.needsRestart) {
       lines.push("");
       lines.push("Restart the gateway to activate triggers.");
+    }
+    if (triggerResult.warnings.length > 0) {
+      lines.push("");
+      lines.push("Trigger compatibility notices:");
+      for (const warning of triggerResult.warnings) {
+        lines.push(`  ! ${warning}`);
+      }
     }
     return lines.join("\n");
   }
@@ -373,8 +380,16 @@ export class OpenExpertsRuntime {
 
     const webhookNeeded = await this.anyWebhookTriggers();
     if (webhookNeeded) {
-      ensureDeep(config, ["hooks", "enabled"], true);
-      checks.push("Webhook triggers detected: enabled hooks. Ensure hooks token is configured.");
+      const hooks = (config.hooks && typeof config.hooks === "object" && !Array.isArray(config.hooks))
+        ? (config.hooks as Record<string, unknown>)
+        : undefined;
+      const hasHooksToken = typeof hooks?.token === "string" && hooks.token.trim().length > 0;
+      if (hasHooksToken) {
+        ensureDeep(config, ["hooks", "enabled"], true);
+        checks.push("Webhook triggers detected: enabled hooks.");
+      } else {
+        checks.push("Webhook triggers detected: hooks.token missing; skipped enabling hooks to avoid invalid runtime config.");
+      }
     }
 
     await writeUtf8(configPath, JSON.stringify(config, null, 2));

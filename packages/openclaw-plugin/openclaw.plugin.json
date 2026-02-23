@@ -1,5 +1,5 @@
 {
-  "id": "openexperts-runtime",
+  "id": "openclaw-plugin",
   "name": "OpenExperts Runtime",
   "description": "Installs and executes OpenExperts packages inside OpenClaw.",
   "version": "0.1.0",

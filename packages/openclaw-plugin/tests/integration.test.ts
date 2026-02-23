@@ -74,6 +74,25 @@ describe("integration: radiant-sales-expert-fixture", () => {
   it("activates the expert", async () => {
     const result = await runtime.activate("radiant-sales-expert");
     expect(result).toContain("Activated");
+    expect(result).toContain("Trigger compatibility notices");
+    expect(result).toContain("Webhook trigger");
+  });
+
+  it("does not write legacy cron.jobs config", async () => {
+    const openclawConfigPath = path.join(dataDir, "openclaw.json");
+    const parsed = JSON.parse(await fs.readFile(openclawConfigPath, "utf8")) as Record<string, unknown>;
+    const cron = parsed.cron as Record<string, unknown> | undefined;
+    expect(cron?.jobs).toBeUndefined();
+  });
+
+  it("keeps webhook config schema-compatible during activation", async () => {
+    const openclawConfigPath = path.join(dataDir, "openclaw.json");
+    const parsed = JSON.parse(await fs.readFile(openclawConfigPath, "utf8")) as Record<string, unknown>;
+    const hooks = parsed.hooks as Record<string, unknown> | undefined;
+    expect(hooks?.enabled).toBeUndefined();
+    expect(hooks?.mappings).toBeUndefined();
+    expect(Array.isArray(hooks?.presets)).toBe(true);
+    expect(hooks?.presets).toContain("gmail");
   });
 
   it("compiled .lobster files exist for both processes", async () => {
@@ -87,7 +106,19 @@ describe("integration: radiant-sales-expert-fixture", () => {
     const triageFile = path.join(dataDir, "compiled", "radiant-sales-expert", "inbound-email-triage.lobster");
     const content = await fs.readFile(triageFile, "utf8");
     expect(content).toContain("approval: required");
-    expect(content).toContain("email");
+    expect(content).toContain("invoke-bound-op");
+    expect(content).toContain("mappedOperation");
+    expect(content).not.toContain("run-binding");
+    expect(content).not.toContain("openclaw.invoke");
+  });
+
+  it("compiled workflow embeds binding context in bound-op commands", async () => {
+    const triageFile = path.join(dataDir, "compiled", "radiant-sales-expert", "inbound-email-triage.lobster");
+    const content = await fs.readFile(triageFile, "utf8");
+    expect(content).toContain("--bindingType 'skill'");
+    expect(content).toContain("--target 'attio'");
+    expect(content).toContain("--bindingType 'mcp'");
+    expect(content).toContain("--target 'nylas-mcp'");
   });
 
   it("state templates were initialized", async () => {
@@ -118,6 +149,7 @@ describe("integration: radiant-sales-expert-fixture", () => {
     const result = await runtime.doctor();
     expect(result).toContain("installed experts: 1");
     expect(result).toContain("compiled workflows fresh:");
+    expect(result).toContain("registered webhook triggers: 0");
   });
 
   it("binding wizard shows no missing tools after full binding", async () => {

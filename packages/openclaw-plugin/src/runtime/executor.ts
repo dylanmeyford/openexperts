@@ -1,6 +1,6 @@
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { exists, writeJson } from "../fs-utils.js";
+import { exists } from "../fs-utils.js";
 import type { ExpertManifest } from "../types.js";
 import { ApprovalService } from "./approvals.js";
 
@@ -31,8 +31,6 @@ export class ProcessExecutor {
       return { ok: false, error: `Compiled workflow not found for process '${input.processName}'` };
     }
 
-    const payloadFile = path.join(input.compiledDir, input.expertName, `${input.processName}.payload.json`);
-    await writeJson(payloadFile, input.payload);
     const retry = input.manifest.execution?.retry;
     const maxAttempts = retry?.max_attempts ?? 1;
     const backoff = retry?.backoff ?? "exponential";
@@ -40,31 +38,29 @@ export class ProcessExecutor {
     const timeoutMs = parseDurationMs(input.manifest.execution?.timeout ?? "0s");
     const failures: string[] = [];
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const result = await runLobster(workflowPath, payloadFile, timeoutMs || this.lobsterTimeoutMs);
+      const result = await runLobster(workflowPath, input.payload, timeoutMs || this.lobsterTimeoutMs);
+      const parsedApproval = parseApprovalSignal([result.output, result.error].filter(Boolean).join("\n"));
+      if (parsedApproval?.resumeToken) {
+        const tier = parsedApproval.tier ?? "confirm";
+        const request = await this.approvalService.createRequest({
+          expertName: input.expertName,
+          operation: parsedApproval.operation ?? "unknown.operation",
+          tier,
+          reason: parsedApproval.reason ?? "Lobster step requires approval",
+          payload: input.payload,
+          resumeToken: parsedApproval.resumeToken,
+          workflowPath,
+          processName: input.processName,
+          timeoutMs: parseDurationMs(input.manifest.policy?.approval?.timeout ?? "0s"),
+        });
+        await this.onApprovalRequired(
+          request.id,
+          `Approval required for ${request.operation}. requestId=${request.id}`,
+        );
+        return { ok: false, error: `Paused awaiting approval. requestId=${request.id}` };
+      }
       if (result.ok) {
         return result;
-      }
-      if (result.error?.includes("needs_approval")) {
-        const parsed = parseApprovalSignal(result.output ?? "");
-        if (parsed?.resumeToken) {
-          const tier = parsed.tier ?? "confirm";
-          const request = await this.approvalService.createRequest({
-            expertName: input.expertName,
-            operation: parsed.operation ?? "unknown.operation",
-            tier,
-            reason: parsed.reason ?? "Lobster step requires approval",
-            payload: input.payload,
-            resumeToken: parsed.resumeToken,
-            workflowPath,
-            processName: input.processName,
-            timeoutMs: parseDurationMs(input.manifest.policy?.approval?.timeout ?? "0s"),
-          });
-          await this.onApprovalRequired(
-            request.id,
-            `Approval required for ${request.operation}. requestId=${request.id}`,
-          );
-          return { ok: false, error: `Paused awaiting approval. requestId=${request.id}` };
-        }
       }
       failures.push(`attempt ${attempt}: ${result.error ?? "unknown error"}`);
       if (attempt >= maxAttempts) {
@@ -94,9 +90,11 @@ export class ProcessExecutor {
   }
 }
 
-function runLobster(workflowPath: string, payloadFile: string, timeoutMs: number): Promise<RunProcessResult> {
+function runLobster(workflowPath: string, payload: Record<string, unknown>, timeoutMs: number): Promise<RunProcessResult> {
   return new Promise((resolve) => {
-    const child = spawn("lobster", ["run", workflowPath, "--input", payloadFile], { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("lobster", ["run", workflowPath, "--args-json", JSON.stringify(payload)], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (buf) => {
@@ -126,7 +124,7 @@ function runLobster(workflowPath: string, payloadFile: string, timeoutMs: number
         resolve({ ok: true, output: stdout.trim() });
       } else {
         const error = stderr.trim() || `lobster exited with code ${code}`;
-        resolve({ ok: false, error, output: stdout.trim() });
+        resolve({ ok: false, error, output: stdout.trim() || stderr.trim() });
       }
     });
   });

@@ -8,7 +8,8 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist",
-    "openclaw.plugin.json"
+    "openclaw.plugin.json",
+    "hooks"
   ],
   "scripts": {
     "build": "tsup src/index.ts --format esm --dts",
